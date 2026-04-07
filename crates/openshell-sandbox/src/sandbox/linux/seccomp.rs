@@ -78,6 +78,30 @@ fn build_filter(allow_inet: bool) -> Result<seccompiler::BpfProgram> {
     // Filesystem mount could subvert Landlock or overlay writable paths.
     rules.entry(libc::SYS_mount).or_default();
 
+    // --- SysV IPC blocks ---
+    // Shared memory, message queues, and semaphores provide cross-UID IPC
+    // channels that bypass the mediator's IPC controls.
+    rules.entry(libc::SYS_shmget).or_default();
+    rules.entry(libc::SYS_shmat).or_default();
+    rules.entry(libc::SYS_shmctl).or_default();
+    rules.entry(libc::SYS_shmdt).or_default();
+    rules.entry(libc::SYS_msgget).or_default();
+    rules.entry(libc::SYS_msgsnd).or_default();
+    rules.entry(libc::SYS_msgrcv).or_default();
+    rules.entry(libc::SYS_msgctl).or_default();
+    rules.entry(libc::SYS_semget).or_default();
+    rules.entry(libc::SYS_semop).or_default();
+    rules.entry(libc::SYS_semctl).or_default();
+
+    // --- UID escape blocks ---
+    // Prevent sandboxed processes from changing their UID/GID, which would
+    // break UID-based isolation.
+    rules.entry(libc::SYS_setuid).or_default();
+    rules.entry(libc::SYS_setgid).or_default();
+    rules.entry(libc::SYS_setgroups).or_default();
+    rules.entry(libc::SYS_setresuid).or_default();
+    rules.entry(libc::SYS_setresgid).or_default();
+
     // --- Conditional syscall blocks ---
 
     // execveat with AT_EMPTY_PATH enables fileless execution from an anonymous fd.
@@ -200,6 +224,26 @@ mod tests {
         rules.entry(libc::SYS_mount).or_default();
 
         // Unconditional blocks have an empty Vec (no conditions = always match)
+        // SysV IPC
+        rules.entry(libc::SYS_shmget).or_default();
+        rules.entry(libc::SYS_shmat).or_default();
+        rules.entry(libc::SYS_shmctl).or_default();
+        rules.entry(libc::SYS_shmdt).or_default();
+        rules.entry(libc::SYS_msgget).or_default();
+        rules.entry(libc::SYS_msgsnd).or_default();
+        rules.entry(libc::SYS_msgrcv).or_default();
+        rules.entry(libc::SYS_msgctl).or_default();
+        rules.entry(libc::SYS_semget).or_default();
+        rules.entry(libc::SYS_semop).or_default();
+        rules.entry(libc::SYS_semctl).or_default();
+
+        // UID escape
+        rules.entry(libc::SYS_setuid).or_default();
+        rules.entry(libc::SYS_setgid).or_default();
+        rules.entry(libc::SYS_setgroups).or_default();
+        rules.entry(libc::SYS_setresuid).or_default();
+        rules.entry(libc::SYS_setresgid).or_default();
+
         for syscall in [
             libc::SYS_memfd_create,
             libc::SYS_ptrace,
@@ -207,6 +251,24 @@ mod tests {
             libc::SYS_process_vm_readv,
             libc::SYS_io_uring_setup,
             libc::SYS_mount,
+            // SysV IPC
+            libc::SYS_shmget,
+            libc::SYS_shmat,
+            libc::SYS_shmctl,
+            libc::SYS_shmdt,
+            libc::SYS_msgget,
+            libc::SYS_msgsnd,
+            libc::SYS_msgrcv,
+            libc::SYS_msgctl,
+            libc::SYS_semget,
+            libc::SYS_semop,
+            libc::SYS_semctl,
+            // UID escape
+            libc::SYS_setuid,
+            libc::SYS_setgid,
+            libc::SYS_setgroups,
+            libc::SYS_setresuid,
+            libc::SYS_setresgid,
         ] {
             assert!(
                 rules.contains_key(&syscall),

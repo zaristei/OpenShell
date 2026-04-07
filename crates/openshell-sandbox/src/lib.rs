@@ -13,6 +13,7 @@ mod identity;
 pub mod l7;
 pub mod log_push;
 pub mod mechanistic_mapper;
+pub mod mediator;
 pub mod opa;
 mod policy;
 mod process;
@@ -418,6 +419,9 @@ pub async fn run_sandbox(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
+    // Create shared UID policy registry for mediator↔proxy communication.
+    let uid_registry = mediator::registry::UidPolicyRegistry::new();
+
     let (_proxy, denial_rx, bypass_denial_tx) = if matches!(policy.network.mode, NetworkMode::Proxy)
     {
         let proxy_policy = policy.network.proxy.as_ref().ok_or_else(|| {
@@ -471,6 +475,7 @@ pub async fn run_sandbox(
             inference_ctx,
             secret_resolver.clone(),
             denial_tx,
+            Some(uid_registry.clone()),
         )
         .await?;
         (Some(proxy_handle), denial_rx, bypass_denial_tx)
@@ -495,6 +500,67 @@ pub async fn run_sandbox(
     // On non-Linux, bypass_denial_tx is unused (no /dev/kmsg).
     #[cfg(not(target_os = "linux"))]
     drop(bypass_denial_tx);
+
+    // ── Embedded mediator ────────────────────────────────────────────────
+    // Bootstrap the mediator in the same tokio runtime. The mediator and
+    // proxy share the UidPolicyRegistry so forked workflows' network policies
+    // are immediately visible to the proxy.
+    let mediator_cancel = tokio_util::sync::CancellationToken::new();
+    let mediator_root_token = {
+        let mediator_socket = std::env::var("MEDIATOR_SOCKET")
+            .unwrap_or_else(|_| "/run/openshell/mediator.sock".into());
+        let mediator_db = std::env::var("MEDIATOR_DB")
+            .unwrap_or_else(|_| "sqlite:///var/lib/openshell/mediator.db?mode=rwc".into());
+        let approval_bridge = std::env::var("APPROVAL_BRIDGE_URL").ok();
+
+        let trust_spec_path = std::env::var("MEDIATOR_TRUST_SPEC")
+            .ok()
+            .map(std::path::PathBuf::from);
+        let init_inference_endpoint = std::env::var("INIT_INFERENCE_ENDPOINT").ok();
+
+        let config = mediator::MediatorConfig {
+            socket_path: std::path::PathBuf::from(&mediator_socket),
+            db_path: mediator_db,
+            hmac_key_bytes: None,
+            approval_bridge_url: approval_bridge,
+            trust_spec_path,
+            init_inference_endpoint,
+        };
+
+        match mediator::init::bootstrap_embedded(&config, uid_registry.clone()).await {
+            Ok(result) => {
+                let root_token = result.root_token.clone();
+
+                // Set socket permissions so agent UIDs can connect.
+                let cancel = mediator_cancel.clone();
+                tokio::spawn(async move {
+                    // Bind and serve the mediator daemon.
+                    if let Err(e) = result.daemon.bind_and_serve(cancel).await {
+                        warn!(error = %e, "Mediator daemon exited with error");
+                    }
+                });
+
+                // Give the daemon a moment to bind the socket.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+                // Make socket world-accessible so sandboxed UIDs can connect.
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = std::fs::set_permissions(
+                        &mediator_socket,
+                        std::os::unix::fs::PermissionsExt::from_mode(0o777),
+                    );
+                }
+
+                info!(socket = %mediator_socket, "Embedded mediator started");
+                Some(root_token)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to bootstrap embedded mediator (non-fatal)");
+                None
+            }
+        }
+    };
 
     // Compute the proxy URL and netns fd for SSH sessions.
     // SSH shell processes need both to enforce network policy:
@@ -676,6 +742,13 @@ pub async fn run_sandbox(
         }
     }
 
+    // Inject mediator root token into the environment so the entrypoint
+    // process can authenticate with the mediator.
+    let mut spawn_env = provider_env.clone();
+    if let Some(ref token) = mediator_root_token {
+        spawn_env.insert("MEDIATOR_TOKEN".into(), token.clone());
+    }
+
     #[cfg(target_os = "linux")]
     let mut handle = ProcessHandle::spawn(
         program,
@@ -685,7 +758,7 @@ pub async fn run_sandbox(
         &policy,
         netns.as_ref(),
         ca_file_paths.as_ref(),
-        &provider_env,
+        &spawn_env,
     )?;
 
     #[cfg(not(target_os = "linux"))]
@@ -696,7 +769,7 @@ pub async fn run_sandbox(
         interactive,
         &policy,
         ca_file_paths.as_ref(),
-        &provider_env,
+        &spawn_env,
     )?;
 
     // Store the entrypoint PID so the proxy can resolve TCP peer identity
@@ -802,6 +875,9 @@ pub async fn run_sandbox(
     };
 
     let status = result.into_diagnostic()?;
+
+    // Shut down the embedded mediator.
+    mediator_cancel.cancel();
 
     ocsf_emit!(
         ProcessActivityBuilder::new(ocsf_ctx())

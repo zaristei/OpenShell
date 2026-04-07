@@ -428,6 +428,145 @@ fn parse_body_length(headers: &str) -> Result<BodyLength> {
     Ok(BodyLength::None)
 }
 
+/// Default maximum body size for content inspection buffering (1 MiB).
+const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
+
+/// Buffer the request body from the client for content inspection.
+///
+/// Reads the full body into memory up to `max_bytes`. Returns `None` if the body
+/// exceeds the limit (caller should fall back to streaming). For chunked bodies,
+/// reassembles payloads into a flat buffer (stripping chunk framing).
+///
+/// `overflow` contains any body bytes already consumed during header parsing
+/// (present in `L7Request::raw_header` past the header terminator).
+pub(crate) async fn buffer_request_body<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    body_length: &BodyLength,
+    overflow: &[u8],
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>> {
+    let max_bytes = if max_bytes == 0 {
+        DEFAULT_MAX_BODY_BYTES
+    } else {
+        max_bytes
+    };
+
+    match body_length {
+        BodyLength::None => Ok(Some(Vec::new())),
+        BodyLength::ContentLength(len) => {
+            let total = *len as usize;
+            if total > max_bytes {
+                return Ok(None);
+            }
+            let mut body = Vec::with_capacity(total);
+            body.extend_from_slice(&overflow[..overflow.len().min(total)]);
+            let remaining = total - body.len();
+            if remaining > 0 {
+                let mut buf = vec![0u8; remaining];
+                reader.read_exact(&mut buf).await.into_diagnostic()?;
+                body.extend_from_slice(&buf);
+            }
+            Ok(Some(body))
+        }
+        BodyLength::Chunked => {
+            // Reassemble chunked body into a flat buffer.
+            let mut body = Vec::new();
+            let mut parse_buf = Vec::from(overflow);
+            let mut pos = 0usize;
+            let mut read_buf = [0u8; RELAY_BUF_SIZE];
+
+            loop {
+                // Read chunk size line
+                let size_line_end = loop {
+                    if let Some(end) = find_crlf(&parse_buf, pos) {
+                        break end;
+                    }
+                    let n = reader.read(&mut read_buf).await.into_diagnostic()?;
+                    if n == 0 {
+                        return Err(miette!("Chunked body ended before chunk-size line"));
+                    }
+                    parse_buf.extend_from_slice(&read_buf[..n]);
+                };
+
+                let size_line = std::str::from_utf8(&parse_buf[pos..size_line_end])
+                    .map_err(|_| miette!("Invalid UTF-8 in chunk-size line"))?;
+                let size_token = size_line
+                    .split(';')
+                    .next()
+                    .map(str::trim)
+                    .unwrap_or_default();
+                let chunk_size = usize::from_str_radix(size_token, 16)
+                    .into_diagnostic()
+                    .map_err(|_| miette!("Invalid chunk size: {size_token:?}"))?;
+                pos = size_line_end + 2;
+
+                if chunk_size == 0 {
+                    // Skip trailers — consume until empty line
+                    loop {
+                        let trailer_end = loop {
+                            if let Some(end) = find_crlf(&parse_buf, pos) {
+                                break end;
+                            }
+                            let n = reader.read(&mut read_buf).await.into_diagnostic()?;
+                            if n == 0 {
+                                return Err(miette!(
+                                    "Chunked body ended before trailer terminator"
+                                ));
+                            }
+                            parse_buf.extend_from_slice(&read_buf[..n]);
+                        };
+                        let trailer_line = &parse_buf[pos..trailer_end];
+                        pos = trailer_end + 2;
+                        if trailer_line.is_empty() {
+                            break;
+                        }
+                    }
+                    return Ok(Some(body));
+                }
+
+                // Check total accumulated size
+                if body.len() + chunk_size > max_bytes {
+                    return Ok(None);
+                }
+
+                // Ensure chunk payload + CRLF is in parse_buf
+                let chunk_end = pos + chunk_size;
+                let chunk_with_crlf = chunk_end + 2;
+                while parse_buf.len() < chunk_with_crlf {
+                    let n = reader.read(&mut read_buf).await.into_diagnostic()?;
+                    if n == 0 {
+                        return Err(miette!("Chunked body ended mid-chunk"));
+                    }
+                    parse_buf.extend_from_slice(&read_buf[..n]);
+                }
+
+                body.extend_from_slice(&parse_buf[pos..chunk_end]);
+                pos = chunk_with_crlf;
+
+                // Keep memory bounded
+                if pos > RELAY_BUF_SIZE * 4 {
+                    parse_buf.drain(..pos);
+                    pos = 0;
+                }
+            }
+        }
+    }
+}
+
+/// Forward a buffered body to upstream as a single Content-Length body.
+///
+/// Rewrites the body framing: if the original was chunked, the body is sent as
+/// a fixed-length payload with an updated Content-Length header.
+pub(crate) async fn forward_buffered_body<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    body: &[u8],
+) -> Result<()> {
+    if !body.is_empty() {
+        writer.write_all(body).await.into_diagnostic()?;
+    }
+    Ok(())
+}
+
 /// Relay exactly `len` bytes from reader to writer.
 async fn relay_fixed<R, W>(reader: &mut R, writer: &mut W, len: u64) -> Result<()>
 where
@@ -591,7 +730,7 @@ where
     relay_response(request_method, upstream, client).await
 }
 
-async fn relay_response<U, C>(
+pub(crate) async fn relay_response<U, C>(
     request_method: &str,
     upstream: &mut U,
     client: &mut C,

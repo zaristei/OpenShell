@@ -7,6 +7,7 @@
 //! Parses each request within the tunnel, evaluates it against OPA policy,
 //! and either forwards or denies the request.
 
+use crate::l7::content_inspect::{ContentInspectionPolicy, ContentRuleRegistry, ScanInput};
 use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::secrets::{self, SecretResolver};
@@ -35,6 +36,10 @@ pub struct L7EvalContext {
     pub cmdline_paths: Vec<String>,
     /// Supervisor-only placeholder resolver for outbound headers.
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
+    /// Content inspection rule registry (constructed from endpoint config).
+    pub(crate) content_registry: Option<Arc<ContentRuleRegistry>>,
+    /// Content inspection policy for this endpoint.
+    pub(crate) content_inspection: Option<ContentInspectionPolicy>,
 }
 
 /// Run protocol-aware L7 inspection on a tunnel.
@@ -250,7 +255,42 @@ where
         let _ = &eval_target;
 
         if allowed || config.enforcement == EnforcementMode::Audit {
-            // Forward request to upstream and relay response
+            // Content inspection: scan request body for PII if configured
+            if let (Some(registry), Some(ci_policy)) =
+                (&ctx.content_registry, &ctx.content_inspection)
+            {
+                if ci_policy.egress_mode == crate::l7::content_inspect::InspectionMode::Sync {
+                    let scan_blocked = scan_and_maybe_block(
+                        &req,
+                        client,
+                        upstream,
+                        ctx,
+                        registry,
+                        ci_policy,
+                        &request_info,
+                    )
+                    .await?;
+                    match scan_blocked {
+                        ScanResult::Blocked => return Ok(()),
+                        ScanResult::Relayed(reusable) => {
+                            if !reusable {
+                                debug!(
+                                    host = %ctx.host,
+                                    port = ctx.port,
+                                    "Upstream connection not reusable, closing L7 relay"
+                                );
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        ScanResult::Fallthrough => {
+                            // Body too large for buffering, fall through to streaming
+                        }
+                    }
+                }
+            }
+
+            // Forward request to upstream and relay response (streaming path)
             let outcome = crate::l7::rest::relay_http_request_with_resolver(
                 &req,
                 client,
@@ -358,6 +398,183 @@ pub fn evaluate_l7_request(
     };
 
     Ok((allowed, reason))
+}
+
+/// Result of content inspection + relay attempt.
+enum ScanResult {
+    /// Body was scanned and blocked (403 sent, connection closed).
+    Blocked,
+    /// Body was scanned, allowed, and relayed. Contains upstream reusability.
+    Relayed(bool),
+    /// Body too large to buffer — caller should fall through to streaming.
+    Fallthrough,
+}
+
+/// Buffer request body, scan for PII, and either relay or block.
+async fn scan_and_maybe_block<C, U>(
+    req: &crate::l7::provider::L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    ctx: &L7EvalContext,
+    registry: &ContentRuleRegistry,
+    ci_policy: &ContentInspectionPolicy,
+    request_info: &L7RequestInfo,
+) -> Result<ScanResult>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    use crate::l7::content_inspect::{Action, EgressEnforcement};
+    use crate::l7::rest::{buffer_request_body, forward_buffered_body};
+
+    // Determine overflow bytes (body bytes read during header parsing)
+    let header_end = req
+        .raw_header
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(req.raw_header.len(), |p| p + 4);
+    let overflow = &req.raw_header[header_end..];
+
+    // Buffer body from client
+    let body =
+        match buffer_request_body(client, &req.body_length, overflow, ci_policy.max_body_bytes)
+            .await?
+        {
+            Some(body) => body,
+            None => {
+                debug!(
+                    host = %ctx.host,
+                    port = ctx.port,
+                    "Request body exceeds content inspection limit, skipping scan"
+                );
+                return Ok(ScanResult::Fallthrough);
+            }
+        };
+
+    // Extract content-type from headers for scan input
+    let header_str = std::str::from_utf8(&req.raw_header[..header_end]).unwrap_or("");
+    let content_type = header_str
+        .lines()
+        .find_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("content-type:") {
+                Some(
+                    line.split_once(':')
+                        .map_or("", |(_, v)| v.trim())
+                        .to_string(),
+                )
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    // Run scan
+    let scan_input = ScanInput {
+        body: &body,
+        content_type: &content_type,
+        host: &ctx.host,
+        port: ctx.port,
+        method: &request_info.action,
+        path: &request_info.target,
+    };
+
+    let results = registry.scan_egress(&scan_input);
+
+    // Aggregate matches and determine action
+    let total_matches: usize = results.iter().map(|r| r.matches.len()).sum();
+    let has_block = results.iter().any(|r| r.action == Action::Block);
+
+    if total_matches > 0 {
+        let rule_names: Vec<&str> = results
+            .iter()
+            .filter(|r| !r.matches.is_empty())
+            .flat_map(|r| r.matches.iter().map(|m| m.rule_name.as_str()))
+            .collect();
+        let pattern_types: Vec<&str> = results
+            .iter()
+            .flat_map(|r| r.matches.iter().map(|m| m.pattern_type.as_str()))
+            .collect();
+
+        info!(
+            dst_host = %ctx.host,
+            dst_port = ctx.port,
+            policy = %ctx.policy_name,
+            l7_action = %request_info.action,
+            l7_target = %request_info.target,
+            match_count = total_matches,
+            rules = ?rule_names,
+            pattern_types = ?pattern_types,
+            action = if has_block { "block" } else { "flag" },
+            enforcement = ?ci_policy.egress_enforcement,
+            "CONTENT_SCAN",
+        );
+    }
+
+    // Block if enforcement is Enforce and any rule returned Block
+    if has_block && ci_policy.egress_enforcement == EgressEnforcement::Enforce {
+        crate::l7::rest::RestProvider
+            .deny(
+                req,
+                &ctx.policy_name,
+                "content inspection: PII detected in request body",
+                client,
+            )
+            .await?;
+        return Ok(ScanResult::Blocked);
+    }
+
+    // Relay the buffered body to upstream
+    let rewrite_result = crate::secrets::rewrite_http_header_block(
+        &req.raw_header[..header_end],
+        ctx.secret_resolver.as_deref(),
+    )
+    .map_err(|e| miette!("secret rewrite failed: {e}"))?;
+
+    // Rewrite Content-Length if original was chunked (body is now flat)
+    let rewritten_header = if matches!(req.body_length, crate::l7::provider::BodyLength::Chunked) {
+        rewrite_chunked_to_content_length(&rewrite_result.rewritten, body.len())
+    } else {
+        rewrite_result.rewritten
+    };
+
+    upstream
+        .write_all(&rewritten_header)
+        .await
+        .into_diagnostic()?;
+    forward_buffered_body(upstream, &body).await?;
+    upstream.flush().await.into_diagnostic()?;
+
+    let outcome = crate::l7::rest::relay_response(&req.action, upstream, client).await?;
+    let reusable = matches!(outcome, RelayOutcome::Reusable);
+    Ok(ScanResult::Relayed(reusable))
+}
+
+/// Rewrite HTTP headers to replace Transfer-Encoding: chunked with Content-Length.
+fn rewrite_chunked_to_content_length(header_bytes: &[u8], body_len: usize) -> Vec<u8> {
+    let header_str = String::from_utf8_lossy(header_bytes);
+    let mut result = Vec::new();
+    let mut replaced_te = false;
+
+    for line in header_str.split("\r\n") {
+        if line.is_empty() {
+            break;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("transfer-encoding:") {
+            // Replace with Content-Length
+            if !replaced_te {
+                result.extend_from_slice(format!("Content-Length: {body_len}").as_bytes());
+                result.extend_from_slice(b"\r\n");
+                replaced_te = true;
+            }
+        } else {
+            result.extend_from_slice(line.as_bytes());
+            result.extend_from_slice(b"\r\n");
+        }
+    }
+    result.extend_from_slice(b"\r\n");
+    result
 }
 
 /// Relay HTTP traffic with credential injection only (no L7 OPA evaluation).
