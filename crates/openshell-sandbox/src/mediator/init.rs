@@ -30,6 +30,8 @@ pub struct MediatorConfig {
     /// When set, `policy_propose` sends proposals to Telegram for human approval.
     /// When `None`, proposals are auto-approved (useful for tests).
     pub approval_bridge_url: Option<String>,
+    /// HMAC-SHA256 secret for signing webhook requests to the approval bridge.
+    pub webhook_secret: Option<String>,
     /// Path to the trust specification YAML file for taint analysis.
     /// When set, `policy_propose` performs per-tag taint analysis and includes
     /// violation warnings in the approval payload.
@@ -43,10 +45,11 @@ pub struct MediatorConfig {
 impl Default for MediatorConfig {
     fn default() -> Self {
         Self {
-            socket_path: PathBuf::from("/run/openshell/mediator.sock"),
-            db_path: "sqlite:///var/lib/openshell/mediator.db?mode=rwc".into(),
+            socket_path: PathBuf::from("/sandbox/.mediator/mediator.sock"),
+            db_path: "sqlite:///sandbox/.mediator/mediator.db?mode=rwc".into(),
             hmac_key_bytes: None,
             approval_bridge_url: None,
+            webhook_secret: None,
             trust_spec_path: None,
             init_inference_endpoint: None,
         }
@@ -143,13 +146,15 @@ pub async fn bootstrap(config: &MediatorConfig) -> Result<BootstrapResult, Strin
     let daemon_config = DaemonConfig {
         socket_path: config.socket_path.clone(),
     };
-    let daemon = MediatorDaemon::with_approval_bridge(
+    let daemon = MediatorDaemon::with_shared_registry(
         store,
         token_key,
         policies,
         daemon_config,
         config.approval_bridge_url.clone(),
+        config.webhook_secret.clone(),
         trust_spec,
+        super::registry::UidPolicyRegistry::new(),
     );
 
     Ok(BootstrapResult {
@@ -223,6 +228,7 @@ pub async fn bootstrap_embedded(
         policies,
         daemon_config,
         config.approval_bridge_url.clone(),
+        config.webhook_secret.clone(),
         trust_spec,
         registry,
     );
@@ -261,7 +267,8 @@ fn load_trust_spec(config: &MediatorConfig) -> Result<Option<Arc<TrustSpec>>, St
 /// because init uses the sensitive-only API key (ZDR providers only).
 ///
 /// For general web access, init forks children with appropriate HTTP policies.
-/// All mutating syscalls from init require human operator approval.
+/// Init's syscalls do not require per-call operator approval; the only operator
+/// gate is `policy_propose`, where new capabilities are actually being requested.
 fn create_init_policy(inference_endpoint: Option<&str>) -> MediationPolicy {
     let http_allowlist = match inference_endpoint {
         Some(endpoint) => vec![endpoint.to_string()],
@@ -334,6 +341,7 @@ mod tests {
             db_path: "sqlite::memory:".into(),
             hmac_key_bytes: Some(b"deterministic-test-key-32bytes!!".to_vec()),
             approval_bridge_url: None,
+            webhook_secret: None,
             trust_spec_path: None,
             init_inference_endpoint: None,
         }
@@ -383,6 +391,7 @@ mod tests {
             db_path: "sqlite::memory:".into(),
             hmac_key_bytes: Some(b"test-key-exactly-32-bytes-long!!".to_vec()),
             approval_bridge_url: None,
+            webhook_secret: None,
             trust_spec_path: None,
             init_inference_endpoint: None,
         };

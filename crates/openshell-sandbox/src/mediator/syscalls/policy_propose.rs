@@ -22,8 +22,11 @@ pub struct PolicyProposeParams {
 /// Execute the `policy_propose` syscall.
 ///
 /// When `approval_bridge_url` is `Some`, sends the proposal to the Telegram
-/// approval bridge and polls for a decision. When `None`, auto-approves
-/// (useful for tests).
+/// approval bridge and polls for a decision. When `None`, the proposal is
+/// auto-DENIED — fail-closed by default. Tests that need auto-approval must
+/// opt in via `MEDIATOR_AUTO_APPROVE_ON_NO_BRIDGE=1`. This prevents an agent
+/// from silently escalating its own privileges in a misconfigured deployment
+/// where the operator forgot to wire up the approval bridge.
 ///
 /// # Errors
 ///
@@ -33,6 +36,7 @@ pub async fn handle_policy_propose(
     policies: &tokio::sync::RwLock<HashMap<String, MediationPolicy>>,
     params: PolicyProposeParams,
     approval_bridge_url: Option<&str>,
+    webhook_secret: Option<&str>,
     trust_spec: Option<&Arc<TrustSpec>>,
 ) -> Result<serde_json::Value, String> {
     // Build existing names set for immutability check.
@@ -74,10 +78,27 @@ pub async fn handle_policy_propose(
         }
     }
 
-    // If no approval bridge, auto-approve.
+    // If no approval bridge, fail-closed: auto-DENY unless the test escape
+    // hatch is set. An agent should never be able to acquire new capabilities
+    // without an operator round-trip.
     let Some(bridge_url) = approval_bridge_url else {
+        let auto_approve = std::env::var("MEDIATOR_AUTO_APPROVE_ON_NO_BRIDGE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !auto_approve {
+            warn!(
+                policy = %params.config.policy_name,
+                "policy_propose denied: no approval bridge configured (set MEDIATOR_AUTO_APPROVE_ON_NO_BRIDGE=1 in tests only)"
+            );
+            return Err(
+                "policy_propose denied: no approval bridge configured. \
+                 Configure --approval-bridge-url to enable operator review, \
+                 or set MEDIATOR_AUTO_APPROVE_ON_NO_BRIDGE=1 for tests."
+                    .to_string(),
+            );
+        }
         let mut guard = policies.write().await;
-        let mut result = serde_json::json!({"approved": true});
+        let mut result = serde_json::json!({"approved": true, "reason": "auto-approved (no approval bridge, test mode)"});
         // Include taint warnings in result even for auto-approve.
         if let Some((ref self_taint, ref affected)) = taint_warnings {
             if self_taint.any_trifecta || !affected.is_empty() {
@@ -127,14 +148,7 @@ pub async fn handle_policy_propose(
 
     info!(proposal_id = %proposal_id, policy = %params.config.policy_name, "sending policy proposal to approval bridge");
 
-    client
-        .post(&webhook_url)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| format!("failed to reach approval bridge: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("approval bridge rejected webhook: {e}"))?;
+    super::post_to_bridge(&client, &webhook_url, &payload, webhook_secret).await?;
 
     // Poll for decision.
     let poll_url = format!("{bridge_url}/policy-decisions");
@@ -230,6 +244,10 @@ mod tests {
     }
 
     async fn test_pool() -> MediatorStore {
+        // Unit tests opt in to the legacy auto-approve fallback. Production
+        // fail-closes when no approval bridge is configured.
+        // SAFETY: cargo test runs each test binary in its own process.
+        unsafe { std::env::set_var("MEDIATOR_AUTO_APPROVE_ON_NO_BRIDGE", "1") };
         MediatorStore::open("sqlite::memory:").await.unwrap()
     }
 

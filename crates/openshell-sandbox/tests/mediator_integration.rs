@@ -18,11 +18,17 @@ use tokio::net::UnixStream;
 // ---------------------------------------------------------------------------
 
 fn test_config(socket_path: PathBuf) -> MediatorConfig {
+    // policy_propose fail-closes when no approval bridge is configured.
+    // Tests opt in to the legacy auto-approve behavior so they can exercise
+    // the rest of the syscall path without standing up a real bridge.
+    // SAFETY: integration tests run in their own process; setting env is OK.
+    unsafe { std::env::set_var("MEDIATOR_AUTO_APPROVE_ON_NO_BRIDGE", "1") };
     MediatorConfig {
         socket_path,
         db_path: "sqlite::memory:".into(),
         hmac_key_bytes: Some(b"integration-test-key-32bytes!".to_vec()),
         approval_bridge_url: None,
+            webhook_secret: None,
         trust_spec_path: None,
         init_inference_endpoint: None,
     }

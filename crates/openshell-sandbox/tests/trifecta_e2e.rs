@@ -83,6 +83,10 @@ async fn start_mediator_with_trust_spec() -> (
     tokio_util::sync::CancellationToken,
     sqlx::SqlitePool,
 ) {
+    // policy_propose fail-closes without an approval bridge in production.
+    // Tests opt in to the legacy auto-approve to exercise the rest of the path.
+    // SAFETY: integration tests run in their own process.
+    unsafe { std::env::set_var("MEDIATOR_AUTO_APPROVE_ON_NO_BRIDGE", "1") };
     let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
 
     // Write trust spec to a temp file.
@@ -94,6 +98,7 @@ async fn start_mediator_with_trust_spec() -> (
         db_path: "sqlite::memory:".into(),
         hmac_key_bytes: Some(b"trifecta-test-key-32bytes-ok!".to_vec()),
         approval_bridge_url: None,
+            webhook_secret: None,
         trust_spec_path: Some(spec_path),
         init_inference_endpoint: None,
     };

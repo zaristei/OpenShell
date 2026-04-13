@@ -11,8 +11,8 @@
 //!   mediator-daemon [--socket PATH] [--db PATH] [--token-file PATH] [--trust-spec PATH]
 //!
 //! Environment (fallbacks):
-//!   MEDIATOR_SOCKET       UDS path (default: /run/openshell/mediator.sock)
-//!   MEDIATOR_DB           SQLite path (default: sqlite:///var/lib/openshell/mediator.db?mode=rwc)
+//!   MEDIATOR_SOCKET       UDS path (default: /sandbox/.mediator/mediator.sock)
+//!   MEDIATOR_DB           SQLite path (default: sqlite:///sandbox/.mediator/mediator.db?mode=rwc)
 //!   MEDIATOR_TRUST_SPEC   Trust spec YAML path (optional)
 //!   INIT_INFERENCE_ENDPOINT  Inference URL for init policy (optional)
 
@@ -32,14 +32,16 @@ fn main() {
     // Parse args (simple flag parsing, no clap dependency for this binary).
     let args: Vec<String> = std::env::args().collect();
     let mut socket = std::env::var("MEDIATOR_SOCKET")
-        .unwrap_or_else(|_| "/run/openshell/mediator.sock".into());
+        .unwrap_or_else(|_| "/sandbox/.mediator/mediator.sock".into());
     let mut db = std::env::var("MEDIATOR_DB")
-        .unwrap_or_else(|_| "sqlite:///var/lib/openshell/mediator.db?mode=rwc".into());
+        .unwrap_or_else(|_| "sqlite:///sandbox/.mediator/mediator.db?mode=rwc".into());
     let mut token_file = String::new();
     let mut trust_spec: Option<PathBuf> = std::env::var("MEDIATOR_TRUST_SPEC")
         .ok()
         .map(PathBuf::from);
     let mut inference_endpoint = std::env::var("INIT_INFERENCE_ENDPOINT").ok();
+    let mut approval_bridge_url = std::env::var("APPROVAL_BRIDGE_URL").ok();
+    let mut webhook_secret = std::env::var("WEBHOOK_SECRET").ok();
 
     let mut i = 1;
     while i < args.len() {
@@ -64,6 +66,14 @@ fn main() {
                 inference_endpoint = args.get(i + 1).cloned();
                 i += 2;
             }
+            "--approval-bridge-url" => {
+                approval_bridge_url = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--webhook-secret" => {
+                webhook_secret = args.get(i + 1).cloned();
+                i += 2;
+            }
             "--help" | "-h" => {
                 eprintln!(
                     "mediator-daemon — standalone mediator for sandbox containers\n\n\
@@ -73,7 +83,10 @@ fn main() {
                        --db <path>                  SQLite path (env: MEDIATOR_DB)\n  \
                        --token-file <path>          Write root token here (default: <socket>.token)\n  \
                        --trust-spec <path>          Trust spec YAML (env: MEDIATOR_TRUST_SPEC)\n  \
-                       --inference-endpoint <url>   Init's inference URL (env: INIT_INFERENCE_ENDPOINT)"
+                       --inference-endpoint <url>   Init's inference URL (env: INIT_INFERENCE_ENDPOINT)\n  \
+                       --approval-bridge-url <url>  Operator approval bridge (env: APPROVAL_BRIDGE_URL)\n  \
+                                                    When unset, policy_propose fail-CLOSES.\n  \
+                       --webhook-secret <secret>    HMAC-SHA256 secret for signing bridge requests (env: WEBHOOK_SECRET)"
                 );
                 std::process::exit(0);
             }
@@ -93,7 +106,8 @@ fn main() {
         socket_path: PathBuf::from(&socket),
         db_path: db,
         hmac_key_bytes: None,
-        approval_bridge_url: std::env::var("APPROVAL_BRIDGE_URL").ok(),
+        approval_bridge_url,
+        webhook_secret,
         trust_spec_path: trust_spec,
         init_inference_endpoint: inference_endpoint,
     };

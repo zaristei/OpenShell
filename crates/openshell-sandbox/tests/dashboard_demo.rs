@@ -47,12 +47,18 @@ async fn dashboard_demo() {
 
     let spec = Arc::new(TrustSpec::load_from_str(TRUST_SPEC_YAML).unwrap());
 
+    // policy_propose fail-closes without an approval bridge in production.
+    // Tests opt in to the legacy auto-approve so they can exercise the syscall
+    // path without standing up a real bridge.
+    // SAFETY: integration tests run in their own process.
+    unsafe { std::env::set_var("MEDIATOR_AUTO_APPROVE_ON_NO_BRIDGE", "1") };
     let dir = tempfile::tempdir().unwrap();
     let config = MediatorConfig {
         socket_path: dir.path().join("demo.sock"),
         db_path: "sqlite::memory:".into(),
         hmac_key_bytes: Some(b"demo-key-exactly-32-bytes-long!!".to_vec()),
         approval_bridge_url: None,
+            webhook_secret: None,
         trust_spec_path: None,
         init_inference_endpoint: None,
     };

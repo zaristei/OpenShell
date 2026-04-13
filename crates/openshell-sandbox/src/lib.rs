@@ -508,9 +508,9 @@ pub async fn run_sandbox(
     let mediator_cancel = tokio_util::sync::CancellationToken::new();
     let mediator_root_token = {
         let mediator_socket = std::env::var("MEDIATOR_SOCKET")
-            .unwrap_or_else(|_| "/run/openshell/mediator.sock".into());
+            .unwrap_or_else(|_| "/sandbox/.mediator/mediator.sock".into());
         let mediator_db = std::env::var("MEDIATOR_DB")
-            .unwrap_or_else(|_| "sqlite:///var/lib/openshell/mediator.db?mode=rwc".into());
+            .unwrap_or_else(|_| "sqlite:///sandbox/.mediator/mediator.db?mode=rwc".into());
         let approval_bridge = std::env::var("APPROVAL_BRIDGE_URL").ok();
 
         let trust_spec_path = std::env::var("MEDIATOR_TRUST_SPEC")
@@ -523,6 +523,7 @@ pub async fn run_sandbox(
             db_path: mediator_db,
             hmac_key_bytes: None,
             approval_bridge_url: approval_bridge,
+            webhook_secret: None,
             trust_spec_path,
             init_inference_endpoint,
         };

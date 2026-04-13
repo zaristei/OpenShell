@@ -37,6 +37,9 @@ pub struct SyscallContext {
     pub policies: Arc<tokio::sync::RwLock<HashMap<String, MediationPolicy>>>,
     /// Approval bridge base URL. When `None`, proposals auto-approve.
     pub approval_bridge_url: Option<String>,
+    /// HMAC-SHA256 secret for signing webhook requests to the approval bridge.
+    /// When `None`, requests are sent without a signature.
+    pub webhook_secret: Option<String>,
     /// Trust specification for taint analysis. When `None`, taint analysis is skipped.
     pub trust_spec: Option<Arc<TrustSpec>>,
     /// Monotonic UID allocator for workflow isolation.
@@ -47,6 +50,37 @@ pub struct SyscallContext {
     pub uid_policy_registry: UidPolicyRegistry,
     /// Active IPC stream registry for lifecycle management.
     pub stream_registry: ipc_connect::StreamRegistry,
+}
+
+/// Sign a request body with HMAC-SHA256 and POST it to the bridge.
+pub(crate) async fn post_to_bridge(
+    client: &reqwest::Client,
+    url: &str,
+    payload: &serde_json::Value,
+    webhook_secret: Option<&str>,
+) -> Result<(), String> {
+    let body = serde_json::to_vec(payload).unwrap_or_default();
+    let mut req = client.post(url).header("Content-Type", "application/json");
+
+    if let Some(secret) = webhook_secret {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+            .map_err(|e| format!("HMAC key error: {e}"))?;
+        mac.update(&body);
+        let signature = hex::encode(mac.finalize().into_bytes());
+        req = req.header("X-OpenShell-Signature", signature);
+    }
+
+    req.body(body)
+        .send()
+        .await
+        .map_err(|e| format!("failed to reach approval bridge: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("approval bridge rejected webhook: {e}"))?;
+
+    Ok(())
 }
 
 /// Dispatch a request to the appropriate syscall handler.
@@ -78,33 +112,12 @@ pub async fn dispatch(ctx: &SyscallContext, req: &Request, _peer: &PeerCred) -> 
     let method = method_name(req.method);
     debug!(method = %method, workflow_id = %caller_token.workflow_id, "dispatching syscall");
 
-    // Human gate: init process requires operator approval for mutating syscalls.
-    if caller_token.workflow_id == "init" && requires_approval(req.method) {
-        if let Some(ref bridge_url) = ctx.approval_bridge_url {
-            match request_syscall_approval(bridge_url, &method, &req.params, &caller_token.policy_name).await {
-                Ok(true) => {
-                    debug!(method = %method, "init syscall approved by operator");
-                }
-                Ok(false) => {
-                    audit::audit_syscall(
-                        pool,
-                        &caller_token.workflow_id,
-                        &req.workflow_token,
-                        &method,
-                        &req.params,
-                        "denied",
-                        &caller_token.policy_name,
-                        Some("denied by operator"),
-                    )
-                    .await;
-                    return Response::err(req.id.clone(), "EPERM", "syscall denied by operator");
-                }
-                Err(e) => {
-                    return Response::err(req.id.clone(), "EINTERNAL", format!("approval gate error: {e}"));
-                }
-            }
-        }
-    }
+    // Init's mutating syscalls (fork, ipc, signal, request_port, revoke) used to
+    // go through a per-call operator approval gate. Removed: init was approved at
+    // deployment time and the gate just produced noise — and double-prompted on
+    // policy_propose, which has its own approval round-trip in handle_policy_propose.
+    // The only operator gate that remains is policy_propose itself, where new
+    // capabilities are actually being requested.
 
     let response = match req.method {
         Method::Ps => {
@@ -219,6 +232,7 @@ pub async fn dispatch(ctx: &SyscallContext, req: &Request, _peer: &PeerCred) -> 
                 &ctx.policies,
                 params,
                 ctx.approval_bridge_url.as_deref(),
+                ctx.webhook_secret.as_deref(),
                 ctx.trust_spec.as_ref(),
             )
             .await
@@ -333,83 +347,4 @@ fn method_name(m: Method) -> String {
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| format!("{m:?}"))
-}
-
-/// Determine whether a syscall method requires human approval for the init process.
-/// Read-only operations (ps, policy_list, policy_get) are exempt.
-fn requires_approval(method: Method) -> bool {
-    !matches!(method, Method::Ps | Method::PolicyList | Method::PolicyGet)
-}
-
-/// POST a syscall approval request to the approval bridge and poll for decision.
-///
-/// Returns `Ok(true)` if approved, `Ok(false)` if denied, `Err` on communication failure.
-async fn request_syscall_approval(
-    bridge_url: &str,
-    method: &str,
-    params: &serde_json::Value,
-    policy_name: &str,
-) -> Result<bool, String> {
-    let approval_id = format!(
-        "syscall_{method}_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    );
-
-    let client = reqwest::Client::new();
-    let webhook_url = format!("{bridge_url}/webhook");
-    let payload = serde_json::json!({
-        "event": "mediator_syscall_approval",
-        "approval_id": approval_id,
-        "method": method,
-        "params": params,
-        "policy_name": policy_name,
-        "caller": "init",
-    });
-
-    tracing::info!(approval_id = %approval_id, method, "requesting operator approval for init syscall");
-
-    client
-        .post(&webhook_url)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| format!("failed to reach approval bridge: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("approval bridge rejected webhook: {e}"))?;
-
-    // Poll for decision.
-    let poll_url = format!("{bridge_url}/syscall-decisions");
-    let poll_interval = std::time::Duration::from_secs(2);
-    let timeout = std::time::Duration::from_secs(300);
-    let start = std::time::Instant::now();
-
-    loop {
-        if start.elapsed() > timeout {
-            return Err("syscall approval timed out".into());
-        }
-
-        tokio::time::sleep(poll_interval).await;
-
-        let resp = client
-            .get(&poll_url)
-            .send()
-            .await
-            .map_err(|e| format!("failed to poll decisions: {e}"))?;
-
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("bad decision response: {e}"))?;
-
-        if let Some(decisions) = body["decisions"].as_array() {
-            for decision in decisions {
-                if decision["approval_id"].as_str() == Some(&approval_id) {
-                    return Ok(decision["approved"].as_bool().unwrap_or(false));
-                }
-            }
-        }
-    }
 }

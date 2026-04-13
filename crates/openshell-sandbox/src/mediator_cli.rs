@@ -20,7 +20,7 @@
 //!   mediator-cli revoke_policy '{"policy_name": "...", "hard": true}'
 //!
 //! Environment:
-//!   MEDIATOR_SOCKET     Path to mediator UDS (default: /run/openshell/mediator.sock)
+//!   MEDIATOR_SOCKET     Path to mediator UDS (default: /sandbox/.mediator/mediator.sock)
 //!   MEDIATOR_TOKEN      Workflow token for authentication
 
 use bytes::{BufMut, BytesMut};
@@ -48,7 +48,7 @@ fn main() {
     };
 
     let socket_path = std::env::var("MEDIATOR_SOCKET")
-        .unwrap_or_else(|_| "/run/openshell/mediator.sock".into());
+        .unwrap_or_else(|_| "/sandbox/.mediator/mediator.sock".into());
 
     let token = match std::env::var("MEDIATOR_TOKEN") {
         Ok(t) => t,
@@ -149,7 +149,7 @@ METHODS:
   revoke_policy          Revoke a policy             {{"policy_name": "...", "hard": true}}
 
 ENVIRONMENT:
-  MEDIATOR_SOCKET        UDS path (default: /run/openshell/mediator.sock)
+  MEDIATOR_SOCKET        UDS path (default: /sandbox/.mediator/mediator.sock)
   MEDIATOR_TOKEN         Workflow token (required)
 
 EXAMPLES:

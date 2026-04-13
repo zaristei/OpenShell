@@ -25,7 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const MAX_HEADER_BYTES: usize = 8192;
 const INFERENCE_LOCAL_HOST: &str = "inference.local";
@@ -381,7 +381,7 @@ async fn handle_tcp_connection(
     }
 
     let peer_addr = client.peer_addr().into_diagnostic()?;
-    let _local_addr = client.local_addr().into_diagnostic()?;
+    let local_addr = client.local_addr().into_diagnostic()?;
 
     // Fast path: UID-based policy lookup via mediator registry.
     // If the connecting process has a known UID in the registry, use the

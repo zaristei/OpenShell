@@ -70,6 +70,10 @@ async fn rpc(client: &mut UnixStream, req: &serde_json::Value) -> serde_json::Va
 }
 
 async fn start() -> (String, PathBuf, tokio_util::sync::CancellationToken, sqlx::SqlitePool) {
+    // policy_propose fail-closes without an approval bridge in production.
+    // Tests opt in to legacy auto-approve.
+    // SAFETY: integration tests run in their own process.
+    unsafe { std::env::set_var("MEDIATOR_AUTO_APPROVE_ON_NO_BRIDGE", "1") };
     let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
     let spec_path = dir.path().join("trust_spec.yaml");
     std::fs::write(&spec_path, TRUST_SPEC).unwrap();
@@ -79,6 +83,7 @@ async fn start() -> (String, PathBuf, tokio_util::sync::CancellationToken, sqlx:
         db_path: "sqlite::memory:".into(),
         hmac_key_bytes: Some(b"fullstack-e2e-key-32-bytes-!!".to_vec()),
         approval_bridge_url: None,
+            webhook_secret: None,
         trust_spec_path: Some(spec_path),
         init_inference_endpoint: Some("https://host.docker.internal:4000/*".into()),
     };

@@ -32,7 +32,7 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            socket_path: PathBuf::from("/run/openshell/mediator.sock"),
+            socket_path: PathBuf::from("/sandbox/.mediator/mediator.sock"),
         }
     }
 }
@@ -72,6 +72,7 @@ impl MediatorDaemon {
             policies,
             config,
             approval_bridge_url,
+            None,
             trust_spec,
             UidPolicyRegistry::new(),
         )
@@ -84,6 +85,7 @@ impl MediatorDaemon {
         policies: HashMap<String, MediationPolicy>,
         config: DaemonConfig,
         approval_bridge_url: Option<String>,
+        webhook_secret: Option<String>,
         trust_spec: Option<Arc<TrustSpec>>,
         uid_policy_registry: UidPolicyRegistry,
     ) -> Self {
@@ -92,6 +94,7 @@ impl MediatorDaemon {
             token_key,
             policies: Arc::new(RwLock::new(policies)),
             approval_bridge_url,
+            webhook_secret,
             trust_spec,
             uid_allocator: Arc::new(UidAllocator::new()),
             gid_allocator: Arc::new(GidAllocator::new()),
