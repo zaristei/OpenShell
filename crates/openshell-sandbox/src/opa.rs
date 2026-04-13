@@ -719,20 +719,22 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy) -> String {
                     if !e.allowed_ips.is_empty() {
                         ep["allowed_ips"] = e.allowed_ips.clone().into();
                     }
-                    if let Some(ci) = &e.content_inspection {
-                        let mut ci_obj = serde_json::json!({
-                            "egress_mode": ci.egress_mode,
-                            "ingress_mode": ci.ingress_mode,
-                            "egress_enforcement": ci.egress_enforcement,
-                        });
-                        if ci.max_body_bytes > 0 {
-                            ci_obj["max_body_bytes"] = ci.max_body_bytes.into();
-                        }
-                        if !ci.enabled_rules.is_empty() {
-                            ci_obj["enabled_rules"] = ci.enabled_rules.clone().into();
-                        }
-                        ep["content_inspection"] = ci_obj;
-                    }
+                    // TODO: content_inspection field not yet added to NetworkEndpoint proto.
+                    // Uncomment when openshell-policy adds the field.
+                    // if let Some(ci) = &e.content_inspection {
+                    //     let mut ci_obj = serde_json::json!({
+                    //         "egress_mode": ci.egress_mode,
+                    //         "ingress_mode": ci.ingress_mode,
+                    //         "egress_enforcement": ci.egress_enforcement,
+                    //     });
+                    //     if ci.max_body_bytes > 0 {
+                    //         ci_obj["max_body_bytes"] = ci.max_body_bytes.into();
+                    //     }
+                    //     if !ci.enabled_rules.is_empty() {
+                    //         ci_obj["enabled_rules"] = ci.enabled_rules.clone().into();
+                    //     }
+                    //     ep["content_inspection"] = ci_obj;
+                    // }
                     ep
                 })
                 .collect();
