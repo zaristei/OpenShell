@@ -16,7 +16,6 @@
 //!   mediator-cli ipc_send '{"target_workflow_id": "wf_2", "message": {...}}'
 //!   mediator-cli signal '{"target_workflow_id": "wf_2", "signal": "term"}'
 //!   mediator-cli request_port
-//!   mediator-cli http_request '{"requests": [{"method": "GET", "url": "..."}]}'
 //!   mediator-cli revoke_policy '{"policy_name": "...", "hard": true}'
 //!
 //! Environment:
