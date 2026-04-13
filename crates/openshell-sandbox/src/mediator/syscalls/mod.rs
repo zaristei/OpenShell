@@ -3,6 +3,7 @@
 
 //! Syscall dispatch: routes incoming requests to the appropriate handler.
 
+pub mod child_runner;
 pub mod fork_with_policy;
 pub mod ipc_connect;
 pub mod ipc_send;

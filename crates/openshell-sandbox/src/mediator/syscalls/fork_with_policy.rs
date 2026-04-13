@@ -167,12 +167,38 @@ pub async fn handle_fork_with_policy(
     // 12. Materialize pre-computed compromised resources from policy taint.
     materialize_compromises(pool, &workflow.policy_name, &params.workflow_id).await;
 
-    info!(
-        workflow_id = %params.workflow_id,
+    // 13. Spawn the child process under the allocated UID.
+    let mediator_socket = std::env::var("MEDIATOR_SOCKET")
+        .unwrap_or_else(|_| "/sandbox/.mediator/mediator.sock".into());
+    let instance_dir = format!("/sandbox/.mediator/workflows/{}", params.workflow_id);
+    match super::child_runner::spawn_child_process(
         uid,
-        gid = policy_gid,
-        "forked workflow with UID isolation"
-    );
+        policy_gid,
+        &params.workflow_id,
+        token_value.as_str(),
+        &mediator_socket,
+        &instance_dir,
+    ) {
+        Ok(pid) => {
+            info!(
+                workflow_id = %params.workflow_id,
+                uid,
+                gid = policy_gid,
+                pid,
+                "forked workflow with UID isolation + child process"
+            );
+        }
+        Err(e) => {
+            // Process spawn failure is non-fatal — the workflow exists in the DB
+            // and the parent can still IPC with it (messages queue). Log and continue.
+            warn!(
+                workflow_id = %params.workflow_id,
+                uid,
+                %e,
+                "forked workflow but child process spawn failed (non-fatal)"
+            );
+        }
+    }
 
     Ok(ForkResult {
         uid,
