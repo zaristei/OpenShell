@@ -33,9 +33,36 @@ pub fn spawn_child_process(
         ("HOME", instance_dir),
     ];
 
-    // Ensure the instance directory exists.
-    if let Err(e) = std::fs::create_dir_all(instance_dir) {
-        warn!(workflow_id, %e, "failed to create instance dir (child may fail)");
+    // Ensure the instance directory and policy workspace exist, owned by the
+    // child UID/GID. The daemon runs as root, so we must explicitly chown.
+    for dir in &[
+        instance_dir.to_string(),
+        format!("/sandbox/.mediator/policies/{policy_name}/workspace"),
+    ] {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            warn!(workflow_id, path = %dir, %e, "failed to create dir (child may fail)");
+            continue;
+        }
+        unsafe {
+            let c_path = std::ffi::CString::new(dir.as_str()).unwrap();
+            // chown to child UID:GID so the child process can write here.
+            if libc::chown(c_path.as_ptr(), uid, gid) != 0 {
+                warn!(workflow_id, uid, gid, path = %dir, "failed to chown dir");
+            }
+        }
+    }
+    // Ensure intermediate policy dirs are world-traversable (o+x) so the
+    // child UID can reach the workspace leaf directory.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let policy_parent = format!("/sandbox/.mediator/policies/{policy_name}");
+        for dir in &["/sandbox/.mediator/policies", &policy_parent] {
+            if let Ok(m) = std::fs::metadata(dir) {
+                let mode = m.permissions().mode() | 0o0711; // owner rwx, others traverse
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode));
+            }
+        }
     }
 
     let (program, args): (String, Vec<String>) = if command.is_empty() {
