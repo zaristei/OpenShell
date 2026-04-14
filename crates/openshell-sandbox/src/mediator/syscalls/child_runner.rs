@@ -39,7 +39,7 @@ pub fn spawn_child_process(
         (command[0].clone(), command[1..].to_vec())
     };
 
-    let mut cmd = Command::new("setpriv");
+    let mut cmd = Command::new("/usr/bin/setpriv");
     cmd.args([
         "--reuid",
         &uid.to_string(),
