@@ -33,6 +33,11 @@ pub fn spawn_child_process(
         ("HOME", instance_dir),
     ];
 
+    // Ensure the instance directory exists.
+    if let Err(e) = std::fs::create_dir_all(instance_dir) {
+        warn!(workflow_id, %e, "failed to create instance dir (child may fail)");
+    }
+
     let (program, args): (String, Vec<String>) = if command.is_empty() {
         ("/bin/sh".into(), vec!["-c".into(), "exec sleep infinity".into()])
     } else {
