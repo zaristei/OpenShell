@@ -265,6 +265,7 @@ mod tests {
                 bind_ports: None,
                 allowed_ipc_targets: vec![],
                 allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
             },
         };
 
@@ -289,6 +290,7 @@ mod tests {
             bind_ports: None,
             allowed_ipc_targets: vec![],
             allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
         };
         policies.write().await.insert("dup_v1".into(), p.clone());
 
@@ -313,6 +315,7 @@ mod tests {
                 bind_ports: None,
                 allowed_ipc_targets: vec![],
                 allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
             },
         };
 
@@ -336,6 +339,7 @@ mod tests {
                 bind_ports: None,
                 allowed_ipc_targets: vec![],
                 allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
             },
         };
 
@@ -383,6 +387,7 @@ trusted_external: []
                 bind_ports: Some(PortRange(8080, 8099)),
                 allowed_ipc_targets: vec![],
                 allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
             },
         };
 

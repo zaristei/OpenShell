@@ -64,6 +64,7 @@ mod tests {
             bind_ports: Some(PortRange(min, max)),
             allowed_ipc_targets: vec![],
             allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
         }
     }
 
@@ -137,6 +138,7 @@ mod tests {
             bind_ports: None,
             allowed_ipc_targets: vec![],
             allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
         };
 
         let err = handle_request_port(store.pool(), &tok, &policy)

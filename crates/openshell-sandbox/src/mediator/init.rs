@@ -289,6 +289,7 @@ fn create_init_policy(inference_endpoint: Option<&str>) -> MediationPolicy {
             policy_name: "*".into(),
             signals: vec!["term".into(), "kill".into(), "stop".into(), "cont".into()],
         }],
+        allowed_launch_commands: vec![],
     }
 }
 

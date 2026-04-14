@@ -48,6 +48,17 @@ pub struct MediationPolicy {
     /// Policies and signal types for the `signal` syscall.
     #[serde(default)]
     pub allowed_signal_targets: Vec<SignalTarget>,
+
+    /// Allowed launch commands for `fork_with_policy`. Each entry is a
+    /// pattern matched against the command array joined by spaces, using
+    /// the same `fnmatch`-style glob as `http_allowlist` (e.g.
+    /// `"openclaw agent --local *"`, `"/usr/bin/curl *"`).
+    ///
+    /// When empty/absent, any command is allowed (default-open for
+    /// backward compatibility). When non-empty, the command must match
+    /// at least one pattern.
+    #[serde(default)]
+    pub allowed_launch_commands: Vec<String>,
 }
 
 /// A filesystem mount declared by a policy.

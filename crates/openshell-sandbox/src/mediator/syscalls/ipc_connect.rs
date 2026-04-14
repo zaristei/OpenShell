@@ -318,6 +318,7 @@ mod tests {
             bind_ports: None,
             allowed_ipc_targets: ipc_targets.iter().map(|s| (*s).into()).collect(),
             allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
         }
     }
 

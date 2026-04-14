@@ -228,6 +228,7 @@ mod tests {
             bind_ports: None,
             allowed_ipc_targets: vec![],
             allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
         }
     }
 
@@ -357,6 +358,7 @@ mod tests {
             bind_ports: None,
             allowed_ipc_targets: vec![],
             allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
         };
 
         let caller_tok = WorkflowToken {

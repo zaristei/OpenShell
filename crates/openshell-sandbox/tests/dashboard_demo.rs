@@ -83,6 +83,7 @@ async fn dashboard_demo() {
         bind_ports: None,
         allowed_ipc_targets: vec![],
         allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
     }).await;
 
     // 2. Fetcher: grabs untrusted content from the web
@@ -97,6 +98,7 @@ async fn dashboard_demo() {
         bind_ports: None,
         allowed_ipc_targets: vec!["analyzer_*".into()],
         allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
     }).await;
 
     // 3. Analyzer: reads sensitive PII data AND talks to fetcher (IPC)
@@ -113,6 +115,7 @@ async fn dashboard_demo() {
         bind_ports: Some(PortRange(8080, 8089)),
         allowed_ipc_targets: vec!["fetcher_*".into()],
         allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
     }).await;
 
     // 4. Vault accessor: reads credentials, talks to trusted vault only
@@ -125,6 +128,7 @@ async fn dashboard_demo() {
         bind_ports: None,
         allowed_ipc_targets: vec![],
         allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
     }).await;
 
     // 5. Scrubbed reader: has PII source but egress scrubber protects IPC to fetcher
@@ -148,6 +152,7 @@ async fn dashboard_demo() {
             scrub_ingress: None,
         })],
         allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
     }).await;
 
     // 6. Leaker: writes to shared path that fetcher reads — filesystem taint edge
@@ -163,6 +168,7 @@ async fn dashboard_demo() {
         bind_ports: Some(PortRange(9000, 9009)),
         allowed_ipc_targets: vec![],
         allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
     }).await;
 
     // ── Fork some workflows ──────────────────────────────────────────

@@ -838,6 +838,7 @@ trusted_external:
             bind_ports: None,
             allowed_ipc_targets: vec![],
             allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
         }
     }
 

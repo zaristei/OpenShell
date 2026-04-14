@@ -28,6 +28,8 @@ pub struct ForkParams {
     pub workflow_id: String,
     pub policy_name: String,
     pub inherit: bool,
+    #[serde(default)]
+    pub command: Vec<String>,
 }
 
 /// Successful result of `fork_with_policy`.
@@ -84,6 +86,21 @@ pub async fn handle_fork_with_policy(
         ));
     }
 
+    // 3b. Validate command against allowed_launch_commands.
+    if !_target_policy.allowed_launch_commands.is_empty() && !params.command.is_empty() {
+        let command_str = params.command.join(" ");
+        let allowed = _target_policy
+            .allowed_launch_commands
+            .iter()
+            .any(|pattern| fnmatch(pattern, &command_str));
+        if !allowed {
+            return Err(format!(
+                "command '{}' does not match any allowed_launch_commands in policy '{}'",
+                command_str, params.policy_name
+            ));
+        }
+    }
+
     // Clone external mounts before releasing the lock.
     let target_mounts = _target_policy.external_mounts.clone();
     drop(policies_guard);
@@ -114,6 +131,9 @@ pub async fn handle_fork_with_policy(
     } else {
         None
     };
+
+    // Save policy_name before it's moved into the workflow record.
+    let policy_name_for_spawn = params.policy_name.clone();
 
     // 9. Insert into workflow_tokens.
     let wf_token = WorkflowToken {
@@ -175,9 +195,11 @@ pub async fn handle_fork_with_policy(
         uid,
         policy_gid,
         &params.workflow_id,
+        &policy_name_for_spawn,
         token_value.as_str(),
         &mediator_socket,
         &instance_dir,
+        &params.command,
     ) {
         Ok(pid) => {
             info!(
@@ -346,6 +368,7 @@ mod tests {
                 bind_ports: None,
                 allowed_ipc_targets: vec!["*".into()],
                 allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
             },
         );
         m.insert(
@@ -359,6 +382,7 @@ mod tests {
                 bind_ports: None,
                 allowed_ipc_targets: vec![],
                 allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
             },
         );
         m
