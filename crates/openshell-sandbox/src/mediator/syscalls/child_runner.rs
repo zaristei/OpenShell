@@ -59,8 +59,24 @@ pub fn spawn_child_process(
     cmd.env("PATH", "/sandbox:/usr/local/bin:/usr/bin:/bin");
     cmd.current_dir(instance_dir);
     cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
+    // Capture stdout/stderr to files in the instance dir so the parent
+    // can read the child's output (e.g. openclaw agent --local --json).
+    let stdout_path = format!("{instance_dir}/stdout.log");
+    let stderr_path = format!("{instance_dir}/stderr.log");
+    match (
+        std::fs::File::create(&stdout_path),
+        std::fs::File::create(&stderr_path),
+    ) {
+        (Ok(out), Ok(err)) => {
+            cmd.stdout(out);
+            cmd.stderr(err);
+        }
+        _ => {
+            warn!(workflow_id, "failed to create output files, detaching stdio");
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
 
     let result = cmd
         .spawn()
