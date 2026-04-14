@@ -215,6 +215,7 @@ mod tests {
                 policy_name: "child_*".into(),
                 signals: vec!["term".into(), "kill".into()],
             }],
+            allowed_launch_commands: vec![],
         }
     }
 

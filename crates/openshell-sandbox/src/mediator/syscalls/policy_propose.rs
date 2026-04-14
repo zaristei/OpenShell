@@ -269,7 +269,7 @@ mod tests {
             },
         };
 
-        let result = handle_policy_propose(store.pool(), &policies, params, None, None)
+        let result = handle_policy_propose(store.pool(), &policies, params, None, None, None)
             .await
             .unwrap();
         assert_eq!(result["approved"], true);
@@ -295,7 +295,7 @@ mod tests {
         policies.write().await.insert("dup_v1".into(), p.clone());
 
         let params = PolicyProposeParams { config: p };
-        let err = handle_policy_propose(store.pool(), &policies, params, None, None)
+        let err = handle_policy_propose(store.pool(), &policies, params, None, None, None)
             .await
             .unwrap_err();
         assert!(err.contains("already exists"));
@@ -319,7 +319,7 @@ mod tests {
             },
         };
 
-        let err = handle_policy_propose(store.pool(), &policies, params, None, None)
+        let err = handle_policy_propose(store.pool(), &policies, params, None, None, None)
             .await
             .unwrap_err();
         assert!(err.contains("empty"));
@@ -348,6 +348,7 @@ mod tests {
             &policies,
             params,
             Some("http://127.0.0.1:19999"),
+            None,
             None,
         )
         .await
@@ -391,7 +392,7 @@ trusted_external: []
             },
         };
 
-        let result = handle_policy_propose(store.pool(), &policies, params, None, Some(&spec))
+        let result = handle_policy_propose(store.pool(), &policies, params, None, None, Some(&spec))
             .await
             .unwrap();
 

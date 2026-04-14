@@ -110,6 +110,7 @@ fn main() {
         webhook_secret,
         trust_spec_path: trust_spec,
         init_inference_endpoint: inference_endpoint,
+        ..Default::default()
     };
 
     // Create runtime and run.

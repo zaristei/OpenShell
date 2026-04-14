@@ -59,7 +59,6 @@ mod tests {
             bind_ports: None,
             allowed_ipc_targets: vec![],
             allowed_signal_targets: vec![],
-            allowed_launch_commands: vec![],
             primary_policy_name: "child_v1".into(),
             parent_policy_name: Some("parent_v1".into()),
         };

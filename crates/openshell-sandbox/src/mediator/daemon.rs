@@ -27,12 +27,17 @@ use tracing::{error, info, warn};
 pub struct DaemonConfig {
     /// Path for the Unix domain socket.
     pub socket_path: PathBuf,
+    /// Address of the L7 proxy (e.g. `10.200.0.1:3128`).
+    /// Used by iptables rules to allow child UID traffic to the proxy.
+    /// Defaults to `127.0.0.1:3128` when no network namespace is active.
+    pub proxy_addr: std::net::SocketAddr,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             socket_path: PathBuf::from("/sandbox/.mediator/mediator.sock"),
+            proxy_addr: ([127, 0, 0, 1], 3128).into(),
         }
     }
 }
@@ -89,6 +94,7 @@ impl MediatorDaemon {
         trust_spec: Option<Arc<TrustSpec>>,
         uid_policy_registry: UidPolicyRegistry,
     ) -> Self {
+        let proxy_addr = config.proxy_addr;
         let ctx = Arc::new(SyscallContext {
             store,
             token_key,
@@ -100,6 +106,7 @@ impl MediatorDaemon {
             gid_allocator: Arc::new(GidAllocator::new()),
             uid_policy_registry,
             stream_registry: super::syscalls::ipc_connect::StreamRegistry::new(),
+            proxy_addr,
         });
         Self { ctx, config }
     }
@@ -295,6 +302,7 @@ mod tests {
         let sock_path = dir.path().join("test.sock");
         let config = DaemonConfig {
             socket_path: sock_path.clone(),
+            proxy_addr: ([127, 0, 0, 1], 3128).into(),
         };
 
         let daemon = MediatorDaemon::new(store, key, policies, config);
@@ -353,6 +361,7 @@ mod tests {
         let sock_path = dir.path().join("test2.sock");
         let config = DaemonConfig {
             socket_path: sock_path.clone(),
+            proxy_addr: ([127, 0, 0, 1], 3128).into(),
         };
 
         let daemon = MediatorDaemon::new(store, key, HashMap::new(), config);
@@ -434,6 +443,7 @@ mod tests {
         let sock_path = dir.path().join("audit.sock");
         let config = DaemonConfig {
             socket_path: sock_path.clone(),
+            proxy_addr: ([127, 0, 0, 1], 3128).into(),
         };
 
         let pool_clone = store.pool().clone();

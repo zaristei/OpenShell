@@ -59,6 +59,7 @@ pub async fn handle_fork_with_policy(
     uid_allocator: &UidAllocator,
     gid_allocator: &GidAllocator,
     uid_policy_registry: &UidPolicyRegistry,
+    proxy_addr: std::net::SocketAddr,
 ) -> Result<ForkResult, String> {
     // 1. Validate the target policy exists.
     let policies_guard = policies.read().await;
@@ -113,7 +114,7 @@ pub async fn handle_fork_with_policy(
     gid::add_uid_to_group(uid, policy_gid);
 
     // 6. Install per-UID iptables rules.
-    iptables::install_uid_rules(uid, 3128);
+    iptables::install_uid_rules(uid, proxy_addr);
 
     // 7. Create instance directory with setgid.
     setup_instance_dir(&params.policy_name, &params.workflow_id, policy_gid, &target_mounts);
@@ -352,6 +353,9 @@ mod tests {
     use crate::mediator::store::queries::insert_token;
     use tokio::sync::RwLock;
 
+    const TEST_PROXY_ADDR: std::net::SocketAddr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 3128);
+
     fn make_policies() -> HashMap<String, MediationPolicy> {
         let mut m = HashMap::new();
         m.insert(
@@ -419,10 +423,12 @@ mod tests {
                 workflow_id: "wf_child_1".into(),
                 policy_name: "child_v1".into(),
                 inherit: true,
+                command: vec![],
             },
             &uid_alloc,
             &gid_alloc,
             &UidPolicyRegistry::new(),
+                TEST_PROXY_ADDR,
         )
         .await
         .unwrap();
@@ -481,10 +487,12 @@ mod tests {
                 workflow_id: "wf_bad".into(),
                 policy_name: "parent_v1".into(),
                 inherit: true,
+                command: vec![],
             },
             &uid_alloc,
             &gid_alloc,
             &UidPolicyRegistry::new(),
+                TEST_PROXY_ADDR,
         )
         .await
         .unwrap_err();
@@ -523,10 +531,12 @@ mod tests {
                 workflow_id: "wf_mm".into(),
                 policy_name: "child_v1".into(),
                 inherit: false,
+                command: vec![],
             },
             &uid_alloc,
             &gid_alloc,
             &UidPolicyRegistry::new(),
+                TEST_PROXY_ADDR,
         )
         .await
         .unwrap_err();
@@ -557,14 +567,16 @@ mod tests {
 
         let r1 = handle_fork_with_policy(
             store.pool(), &key, &policies, &caller_tok, &caller_policy,
-            ForkParams { workflow_id: "wf_a".into(), policy_name: "child_v1".into(), inherit: true },
+            ForkParams { workflow_id: "wf_a".into(), policy_name: "child_v1".into(), inherit: true, command: vec![] },
             &uid_alloc, &gid_alloc, &UidPolicyRegistry::new(),
+                TEST_PROXY_ADDR,
         ).await.unwrap();
 
         let r2 = handle_fork_with_policy(
             store.pool(), &key, &policies, &caller_tok, &caller_policy,
-            ForkParams { workflow_id: "wf_b".into(), policy_name: "child_v1".into(), inherit: true },
+            ForkParams { workflow_id: "wf_b".into(), policy_name: "child_v1".into(), inherit: true, command: vec![] },
             &uid_alloc, &gid_alloc, &UidPolicyRegistry::new(),
+                TEST_PROXY_ADDR,
         ).await.unwrap();
 
         // Different UIDs

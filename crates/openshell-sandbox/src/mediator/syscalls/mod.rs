@@ -51,6 +51,8 @@ pub struct SyscallContext {
     pub uid_policy_registry: UidPolicyRegistry,
     /// Active IPC stream registry for lifecycle management.
     pub stream_registry: ipc_connect::StreamRegistry,
+    /// L7 proxy address for iptables rules.
+    pub proxy_addr: std::net::SocketAddr,
 }
 
 /// Sign a request body with HMAC-SHA256 and POST it to the bridge.
@@ -148,6 +150,7 @@ pub async fn dispatch(ctx: &SyscallContext, req: &Request, _peer: &PeerCred) -> 
                 &ctx.uid_allocator,
                 &ctx.gid_allocator,
                 &ctx.uid_policy_registry,
+                ctx.proxy_addr,
             )
             .await
             {

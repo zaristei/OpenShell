@@ -40,6 +40,9 @@ pub struct MediatorConfig {
     /// This is the only HTTP endpoint init can reach (e.g. `https://host.docker.internal:4000/*`).
     /// When `None`, init has no HTTP access at all.
     pub init_inference_endpoint: Option<String>,
+    /// L7 proxy address. Passed to iptables rules so child UIDs route
+    /// through the correct proxy address (e.g. `10.200.0.1:3128` in netns).
+    pub proxy_addr: std::net::SocketAddr,
 }
 
 impl Default for MediatorConfig {
@@ -52,6 +55,7 @@ impl Default for MediatorConfig {
             webhook_secret: None,
             trust_spec_path: None,
             init_inference_endpoint: None,
+            proxy_addr: ([127, 0, 0, 1], 3128).into(),
         }
     }
 }
@@ -145,6 +149,7 @@ pub async fn bootstrap(config: &MediatorConfig) -> Result<BootstrapResult, Strin
     // 7. Build daemon.
     let daemon_config = DaemonConfig {
         socket_path: config.socket_path.clone(),
+        proxy_addr: config.proxy_addr,
     };
     let daemon = MediatorDaemon::with_shared_registry(
         store,
@@ -221,6 +226,7 @@ pub async fn bootstrap_embedded(
 
     let daemon_config = DaemonConfig {
         socket_path: config.socket_path.clone(),
+        proxy_addr: config.proxy_addr,
     };
     let daemon = MediatorDaemon::with_shared_registry(
         store,
@@ -341,10 +347,7 @@ mod tests {
             socket_path: PathBuf::from("/tmp/test-mediator.sock"),
             db_path: "sqlite::memory:".into(),
             hmac_key_bytes: Some(b"deterministic-test-key-32bytes!!".to_vec()),
-            approval_bridge_url: None,
-            webhook_secret: None,
-            trust_spec_path: None,
-            init_inference_endpoint: None,
+            ..Default::default()
         }
     }
 
@@ -391,10 +394,7 @@ mod tests {
             socket_path: PathBuf::from("/tmp/unused"), // won't bind
             db_path: "sqlite::memory:".into(),
             hmac_key_bytes: Some(b"test-key-exactly-32-bytes-long!!".to_vec()),
-            approval_bridge_url: None,
-            webhook_secret: None,
-            trust_spec_path: None,
-            init_inference_endpoint: None,
+            ..Default::default()
         };
 
         let result = bootstrap(&config).await.unwrap();

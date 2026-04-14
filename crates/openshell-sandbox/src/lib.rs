@@ -422,7 +422,7 @@ pub async fn run_sandbox(
     // Create shared UID policy registry for mediator↔proxy communication.
     let uid_registry = mediator::registry::UidPolicyRegistry::new();
 
-    let (_proxy, denial_rx, bypass_denial_tx) = if matches!(policy.network.mode, NetworkMode::Proxy)
+    let (_proxy, denial_rx, bypass_denial_tx, proxy_addr) = if matches!(policy.network.mode, NetworkMode::Proxy)
     {
         let proxy_policy = policy.network.proxy.as_ref().ok_or_else(|| {
             miette::miette!("Network mode is set to proxy but no proxy configuration was provided")
@@ -478,9 +478,10 @@ pub async fn run_sandbox(
             Some(uid_registry.clone()),
         )
         .await?;
-        (Some(proxy_handle), denial_rx, bypass_denial_tx)
+        let effective_proxy_addr = bind_addr.unwrap_or_else(|| ([127, 0, 0, 1], 3128).into());
+        (Some(proxy_handle), denial_rx, bypass_denial_tx, effective_proxy_addr)
     } else {
-        (None, None, None)
+        (None, None, None, SocketAddr::from(([127, 0, 0, 1], 3128)))
     };
 
     // Spawn bypass detection monitor (Linux only, proxy mode only).
@@ -526,6 +527,7 @@ pub async fn run_sandbox(
             webhook_secret: None,
             trust_spec_path,
             init_inference_endpoint,
+            proxy_addr,
         };
 
         match mediator::init::bootstrap_embedded(&config, uid_registry.clone()).await {
