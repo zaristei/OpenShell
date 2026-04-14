@@ -269,6 +269,12 @@ async fn materialize_compromises(pool: &SqlitePool, policy_name: &str, workflow_
 ///
 /// On Linux, sets setgid bit and correct ownership. On other platforms, just
 /// creates the directory.
+// TODO: enforce external_mounts — iterate the policy's external_mounts and set
+// group permissions on each path based on mode (r → group-read, rw → group-readwrite,
+// rx → group-read-execute). Currently the mounts field is declared in the policy
+// schema and shown to the operator at approval time, but the daemon never actually
+// grants group access to those paths. Only the instance directory gets setgid + chown.
+// The plumbing is here (_gid, _external_mounts) — just needs the chmod/chgrp loop.
 fn setup_instance_dir(
     policy_name: &str,
     workflow_id: &str,
