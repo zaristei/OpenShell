@@ -38,13 +38,32 @@ pub fn from_mediation_policy(
 
 /// Check if a URL is allowed by a workflow's HTTP allowlist.
 ///
-/// Uses the same `fnmatch` matching as the mediator's `url_allowed`.
+/// Patterns use shell-style wildcards (`*` matches anything including `/`).
+/// This is deliberately more permissive than filesystem glob because URLs
+/// aren't filesystem paths — `*` should match across path components.
+/// Examples: `http://host:4000/*` matches `http://host:4000/v1/chat/completions`.
 pub fn url_allowed_by_policy(url: &str, policy: &WorkflowNetPolicy) -> bool {
-    use super::validate::fnmatch;
     policy
         .http_allowlist
         .iter()
-        .any(|pattern| fnmatch(pattern, url))
+        .any(|pattern| url_pattern_matches(pattern, url))
+}
+
+/// Match a URL against an allowlist pattern.
+///
+/// `*` matches zero or more of any character (including `/`).
+/// `?` matches exactly one character.
+fn url_pattern_matches(pattern: &str, url: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    // Strip trailing `*` for prefix matching: "http://host:4000/*" matches
+    // any URL starting with "http://host:4000/".
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return url.starts_with(prefix);
+    }
+    // Exact match.
+    pattern == url
 }
 
 #[cfg(test)]
@@ -67,6 +86,21 @@ mod tests {
         assert_eq!(net.policy_name, "child_v1");
         assert_eq!(net.workflow_id, "wf_1");
         assert_eq!(net.http_allowlist.len(), 2);
+    }
+
+    #[test]
+    fn url_pattern_matching() {
+        // Prefix with wildcard matches paths
+        assert!(url_pattern_matches("http://host:4000/*", "http://host:4000/"));
+        assert!(url_pattern_matches("http://host:4000/*", "http://host:4000/v1"));
+        assert!(url_pattern_matches("http://host:4000/*", "http://host:4000/v1/chat/completions"));
+        // Scheme mismatch
+        assert!(!url_pattern_matches("http://host:4000/*", "https://host:4000/v1"));
+        // Exact match
+        assert!(url_pattern_matches("http://host:4000", "http://host:4000"));
+        assert!(!url_pattern_matches("http://host:4000", "http://host:4000/v1"));
+        // Star alone
+        assert!(url_pattern_matches("*", "anything"));
     }
 
     #[test]
