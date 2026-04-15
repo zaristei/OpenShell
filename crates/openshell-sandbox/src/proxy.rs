@@ -391,8 +391,12 @@ async fn handle_tcp_connection(
         let peer_port = peer_addr.port();
         if let Some(cred) = peercred::tcp_peer_uid(local_port, peer_port) {
             if let Some(net_policy) = registry.get(cred.uid) {
-                let target_url = format!("https://{host_lc}:{port}");
-                let allowed = url_allowed_by_policy(&target_url, &net_policy)
+                // Check both http:// and https:// schemes since the CONNECT
+                // target doesn't include a scheme. Also check the bare host.
+                let target_https = format!("https://{host_lc}:{port}");
+                let target_http = format!("http://{host_lc}:{port}");
+                let allowed = url_allowed_by_policy(&target_https, &net_policy)
+                    || url_allowed_by_policy(&target_http, &net_policy)
                     || url_allowed_by_policy(&host_lc, &net_policy);
                 if allowed {
                     debug!(
