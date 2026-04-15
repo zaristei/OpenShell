@@ -38,18 +38,38 @@ impl MediatorStore {
     }
 
     /// Run the mediator schema migrations.
+    ///
+    /// Each migration is idempotent: `CREATE TABLE IF NOT EXISTS` for new
+    /// tables, and `ALTER TABLE ADD COLUMN` errors are silently ignored
+    /// (the column already exists from a previous run).
     async fn migrate(pool: &SqlitePool) -> sqlx::Result<()> {
         sqlx::query(include_str!("../../../migrations/mediator/001_init.sql"))
             .execute(pool)
             .await?;
-        sqlx::query(include_str!("../../../migrations/mediator/002_uid_isolation.sql"))
-            .execute(pool)
-            .await?;
-        sqlx::query(include_str!(
+        // ALTER TABLE ADD COLUMN fails with "duplicate column" if re-run.
+        // Ignore that specific error to make the migration idempotent.
+        let alter_result = sqlx::query(include_str!(
+            "../../../migrations/mediator/002_uid_isolation.sql"
+        ))
+        .execute(pool)
+        .await;
+        if let Err(ref e) = alter_result {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column") {
+                alter_result?;
+            }
+        }
+        let alter_result = sqlx::query(include_str!(
             "../../../migrations/mediator/003_compromised_resources.sql"
         ))
         .execute(pool)
-        .await?;
+        .await;
+        if let Err(ref e) = alter_result {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column") && !msg.contains("already exists") {
+                alter_result?;
+            }
+        }
         Ok(())
     }
 }
