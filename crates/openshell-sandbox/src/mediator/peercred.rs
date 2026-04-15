@@ -55,8 +55,10 @@ pub fn tcp_peer_uid(local_port: u16, remote_port: u16) -> Option<TcpPeerCred> {
         }
         let rport = u16::from_str_radix(remote_parts[1], 16).ok()?;
 
-        // Match: our local port is the proxy port, remote port is the peer's port
-        if lport == local_port && rport == remote_port {
+        // Match the CLIENT's row: the client's local port is our remote port,
+        // and the client's remote port is our local port. The client's row
+        // has the actual UID of the connecting process.
+        if lport == remote_port && rport == local_port {
             let uid: u32 = fields[7].parse().ok()?;
             return Some(TcpPeerCred { uid, pid: None });
         }
@@ -82,7 +84,7 @@ pub fn tcp_peer_uid(local_port: u16, remote_port: u16) -> Option<TcpPeerCred> {
             let lport = u16::from_str_radix(local_parts[1], 16).unwrap_or(0);
             let rport = u16::from_str_radix(remote_parts[1], 16).unwrap_or(0);
 
-            if lport == local_port && rport == remote_port {
+            if lport == remote_port && rport == local_port {
                 let uid: u32 = fields[7].parse().ok()?;
                 return Some(TcpPeerCred { uid, pid: None });
             }
