@@ -512,12 +512,29 @@ pub async fn run_sandbox(
             .unwrap_or_else(|_| "/sandbox/.mediator/mediator.sock".into());
         let mediator_db = std::env::var("MEDIATOR_DB")
             .unwrap_or_else(|_| "sqlite:///sandbox/.mediator/mediator.db?mode=rwc".into());
-        let approval_bridge = std::env::var("APPROVAL_BRIDGE_URL").ok();
+        // Read mediator config from env vars first, then fall back to a
+        // JSON config file. The config file is useful when env vars can't be
+        // injected into the sandbox pod spec (e.g. the cluster image sets them
+        // but they don't propagate to pods).
+        let config_file: Option<serde_json::Value> = std::fs::read_to_string(
+            "/sandbox/.mediator/config.json",
+        )
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
 
-        let trust_spec_path = std::env::var("MEDIATOR_TRUST_SPEC")
-            .ok()
-            .map(std::path::PathBuf::from);
-        let init_inference_endpoint = std::env::var("INIT_INFERENCE_ENDPOINT").ok();
+        let cfg_str = |key: &str| -> Option<String> {
+            std::env::var(key).ok().or_else(|| {
+                config_file
+                    .as_ref()
+                    .and_then(|c| c.get(key))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+        };
+
+        let approval_bridge = cfg_str("APPROVAL_BRIDGE_URL");
+        let trust_spec_path = cfg_str("MEDIATOR_TRUST_SPEC").map(std::path::PathBuf::from);
+        let init_inference_endpoint = cfg_str("INIT_INFERENCE_ENDPOINT");
 
         let config = mediator::MediatorConfig {
             socket_path: std::path::PathBuf::from(&mediator_socket),
