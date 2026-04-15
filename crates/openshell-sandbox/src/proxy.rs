@@ -391,13 +391,20 @@ async fn handle_tcp_connection(
         let peer_port = peer_addr.port();
         if let Some(cred) = peercred::tcp_peer_uid(local_port, peer_port) {
             if let Some(net_policy) = registry.get(cred.uid) {
-                // Check both http:// and https:// schemes since the CONNECT
-                // target doesn't include a scheme. Also check the bare host.
-                let target_https = format!("https://{host_lc}:{port}");
-                let target_http = format!("http://{host_lc}:{port}");
-                let allowed = url_allowed_by_policy(&target_https, &net_policy)
-                    || url_allowed_by_policy(&target_http, &net_policy)
-                    || url_allowed_by_policy(&host_lc, &net_policy);
+                // CONNECT target is just host:port — check against allowlist
+                // patterns with both schemes and path variants. The allowlist
+                // may have patterns like "http://host:4000/*" which won't match
+                // the bare "http://host:4000" without a path.
+                let variants = [
+                    format!("https://{host_lc}:{port}"),
+                    format!("https://{host_lc}:{port}/"),
+                    format!("http://{host_lc}:{port}"),
+                    format!("http://{host_lc}:{port}/"),
+                    host_lc.clone(),
+                ];
+                let allowed = variants
+                    .iter()
+                    .any(|v| url_allowed_by_policy(v, &net_policy));
                 if allowed {
                     debug!(
                         uid = cred.uid,
