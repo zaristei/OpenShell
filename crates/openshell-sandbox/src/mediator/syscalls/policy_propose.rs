@@ -78,10 +78,22 @@ pub async fn handle_policy_propose(
         }
     }
 
+    // Re-read approval bridge URL at runtime from the config file. This
+    // solves the boot-ordering problem: the PVC is empty when PID 1 boots,
+    // so the config file (with the bridge URL) is written AFTER bootstrap.
+    // Reading it here means policy_propose picks up the bridge URL as soon
+    // as the config file appears — no pod restart needed.
+    let runtime_bridge: Option<String> = approval_bridge_url.map(String::from).or_else(|| {
+        std::fs::read_to_string("/sandbox/.mediator/config.json")
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|c| c.get("APPROVAL_BRIDGE_URL")?.as_str().map(String::from))
+            .filter(|s| !s.is_empty())
+    });
+
     // If no approval bridge, fail-closed: auto-DENY unless the test escape
-    // hatch is set. An agent should never be able to acquire new capabilities
-    // without an operator round-trip.
-    let Some(bridge_url) = approval_bridge_url else {
+    // hatch is set.
+    let Some(bridge_url) = runtime_bridge.as_deref() else {
         let auto_approve = std::env::var("MEDIATOR_AUTO_APPROVE_ON_NO_BRIDGE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or_else(|_| {
