@@ -84,7 +84,15 @@ pub async fn handle_policy_propose(
     let Some(bridge_url) = approval_bridge_url else {
         let auto_approve = std::env::var("MEDIATOR_AUTO_APPROVE_ON_NO_BRIDGE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+            .unwrap_or_else(|_| {
+                // Fall back to config file (embedded mode may not have env vars).
+                std::fs::read_to_string("/sandbox/.mediator/config.json")
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|c| c.get("MEDIATOR_AUTO_APPROVE_ON_NO_BRIDGE")?.as_str().map(String::from))
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+            });
         if !auto_approve {
             warn!(
                 policy = %params.config.policy_name,
