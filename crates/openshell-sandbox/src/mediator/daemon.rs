@@ -167,7 +167,10 @@ impl MediatorDaemon {
         &self,
         cancel: tokio_util::sync::CancellationToken,
     ) -> std::io::Result<()> {
-        // Remove stale socket file if present.
+        // Ensure parent directory exists and remove stale socket file.
+        if let Some(parent) = self.config.socket_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let _ = std::fs::remove_file(&self.config.socket_path);
         let listener = UnixListener::bind(&self.config.socket_path)?;
         self.serve(listener, cancel).await;

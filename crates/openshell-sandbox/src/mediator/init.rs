@@ -176,6 +176,18 @@ pub async fn bootstrap_embedded(
     config: &MediatorConfig,
     registry: super::registry::UidPolicyRegistry,
 ) -> Result<BootstrapResult, String> {
+    // Ensure parent directories exist for socket and DB.
+    if let Some(parent) = config.socket_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // SQLite path: strip the "sqlite://" prefix to get the filesystem path.
+    if let Some(path) = config.db_path.strip_prefix("sqlite://") {
+        let db_file = path.split('?').next().unwrap_or(path);
+        if let Some(parent) = std::path::Path::new(db_file).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+
     let store = MediatorStore::open(&config.db_path)
         .await
         .map_err(|e| format!("failed to open store: {e}"))?;
