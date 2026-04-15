@@ -555,6 +555,23 @@ pub async fn run_sandbox(
                     );
                 }
 
+                // Write the root token to a file so the mediator-tools plugin
+                // (running in the OpenClaw gateway process) can read it. The
+                // gateway may not inherit MEDIATOR_TOKEN from PID 1's env.
+                let token_path = format!("{mediator_socket}.token");
+                if let Err(e) = std::fs::write(&token_path, &root_token) {
+                    warn!(error = %e, path = %token_path, "Failed to write mediator token file");
+                } else {
+                    // Readable by all UIDs in the sandbox.
+                    #[cfg(target_os = "linux")]
+                    {
+                        let _ = std::fs::set_permissions(
+                            &token_path,
+                            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+                        );
+                    }
+                }
+
                 info!(socket = %mediator_socket, "Embedded mediator started");
                 Some(root_token)
             }
