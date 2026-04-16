@@ -8,6 +8,7 @@
 //! doing a raw `copy_bidirectional`. Each request within the tunnel is parsed,
 //! evaluated against OPA policy, and either forwarded or denied.
 
+pub mod content_inspect;
 pub mod inference;
 pub mod provider;
 pub mod relay;
@@ -59,6 +60,7 @@ pub struct L7EndpointConfig {
     pub protocol: L7Protocol,
     pub tls: TlsMode,
     pub enforcement: EnforcementMode,
+    pub content_inspection: Option<content_inspect::ContentInspectionPolicy>,
 }
 
 /// Result of an L7 policy decision for a single request.
@@ -122,10 +124,21 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         _ => EnforcementMode::Audit,
     };
 
+    let content_inspection = {
+        let ci_key = regorus::Value::String("content_inspection".into());
+        match val {
+            regorus::Value::Object(map) => map
+                .get(&ci_key)
+                .and_then(content_inspect::parse_content_inspection_config),
+            _ => None,
+        }
+    };
+
     Some(L7EndpointConfig {
         protocol,
         tls,
         enforcement,
+        content_inspection,
     })
 }
 

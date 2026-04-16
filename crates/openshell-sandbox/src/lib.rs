@@ -13,6 +13,7 @@ mod identity;
 pub mod l7;
 pub mod log_push;
 pub mod mechanistic_mapper;
+pub mod mediator;
 pub mod opa;
 mod policy;
 mod process;
@@ -418,7 +419,10 @@ pub async fn run_sandbox(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
-    let (_proxy, denial_rx, bypass_denial_tx) = if matches!(policy.network.mode, NetworkMode::Proxy)
+    // Create shared UID policy registry for mediator↔proxy communication.
+    let uid_registry = mediator::registry::UidPolicyRegistry::new();
+
+    let (_proxy, denial_rx, bypass_denial_tx, proxy_addr) = if matches!(policy.network.mode, NetworkMode::Proxy)
     {
         let proxy_policy = policy.network.proxy.as_ref().ok_or_else(|| {
             miette::miette!("Network mode is set to proxy but no proxy configuration was provided")
@@ -471,11 +475,13 @@ pub async fn run_sandbox(
             inference_ctx,
             secret_resolver.clone(),
             denial_tx,
+            Some(uid_registry.clone()),
         )
         .await?;
-        (Some(proxy_handle), denial_rx, bypass_denial_tx)
+        let effective_proxy_addr = bind_addr.unwrap_or_else(|| ([127, 0, 0, 1], 3128).into());
+        (Some(proxy_handle), denial_rx, bypass_denial_tx, effective_proxy_addr)
     } else {
-        (None, None, None)
+        (None, None, None, SocketAddr::from(([127, 0, 0, 1], 3128)))
     };
 
     // Spawn bypass detection monitor (Linux only, proxy mode only).
@@ -495,6 +501,103 @@ pub async fn run_sandbox(
     // On non-Linux, bypass_denial_tx is unused (no /dev/kmsg).
     #[cfg(not(target_os = "linux"))]
     drop(bypass_denial_tx);
+
+    // ── Embedded mediator ────────────────────────────────────────────────
+    // Bootstrap the mediator in the same tokio runtime. The mediator and
+    // proxy share the UidPolicyRegistry so forked workflows' network policies
+    // are immediately visible to the proxy.
+    let mediator_cancel = tokio_util::sync::CancellationToken::new();
+    let mediator_root_token = {
+        let mediator_socket = std::env::var("MEDIATOR_SOCKET")
+            .unwrap_or_else(|_| "/sandbox/.mediator/mediator.sock".into());
+        let mediator_db = std::env::var("MEDIATOR_DB")
+            .unwrap_or_else(|_| "sqlite:///sandbox/.mediator/mediator.db?mode=rwc".into());
+        // Read mediator config from env vars first, then fall back to a
+        // JSON config file. The config file is useful when env vars can't be
+        // injected into the sandbox pod spec (e.g. the cluster image sets them
+        // but they don't propagate to pods).
+        let config_file: Option<serde_json::Value> = std::fs::read_to_string(
+            "/sandbox/.mediator/config.json",
+        )
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+
+        let cfg_str = |key: &str| -> Option<String> {
+            std::env::var(key).ok().or_else(|| {
+                config_file
+                    .as_ref()
+                    .and_then(|c| c.get(key))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+        };
+
+        let approval_bridge = cfg_str("APPROVAL_BRIDGE_URL");
+        let trust_spec_path = cfg_str("MEDIATOR_TRUST_SPEC").map(std::path::PathBuf::from);
+        let init_inference_endpoint = cfg_str("INIT_INFERENCE_ENDPOINT");
+
+        let config = mediator::MediatorConfig {
+            socket_path: std::path::PathBuf::from(&mediator_socket),
+            db_path: mediator_db,
+            hmac_key_bytes: None,
+            approval_bridge_url: approval_bridge,
+            webhook_secret: None,
+            trust_spec_path,
+            init_inference_endpoint,
+            proxy_addr,
+        };
+
+        match mediator::init::bootstrap_embedded(&config, uid_registry.clone()).await {
+            Ok(result) => {
+                let root_token = result.root_token.clone();
+
+                // Set socket permissions so agent UIDs can connect.
+                let cancel = mediator_cancel.clone();
+                tokio::spawn(async move {
+                    // Bind and serve the mediator daemon.
+                    if let Err(e) = result.daemon.bind_and_serve(cancel).await {
+                        warn!(error = %e, "Mediator daemon exited with error");
+                    }
+                });
+
+                // Give the daemon a moment to bind the socket.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+                // Make socket world-accessible so sandboxed UIDs can connect.
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = std::fs::set_permissions(
+                        &mediator_socket,
+                        std::os::unix::fs::PermissionsExt::from_mode(0o777),
+                    );
+                }
+
+                // Write the root token to a file so the mediator-tools plugin
+                // (running in the OpenClaw gateway process) can read it. The
+                // gateway may not inherit MEDIATOR_TOKEN from PID 1's env.
+                let token_path = format!("{mediator_socket}.token");
+                if let Err(e) = std::fs::write(&token_path, &root_token) {
+                    warn!(error = %e, path = %token_path, "Failed to write mediator token file");
+                } else {
+                    // Readable by all UIDs in the sandbox.
+                    #[cfg(target_os = "linux")]
+                    {
+                        let _ = std::fs::set_permissions(
+                            &token_path,
+                            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+                        );
+                    }
+                }
+
+                info!(socket = %mediator_socket, "Embedded mediator started");
+                Some(root_token)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to bootstrap embedded mediator (non-fatal)");
+                None
+            }
+        }
+    };
 
     // Compute the proxy URL and netns fd for SSH sessions.
     // SSH shell processes need both to enforce network policy:
@@ -676,6 +779,13 @@ pub async fn run_sandbox(
         }
     }
 
+    // Inject mediator root token into the environment so the entrypoint
+    // process can authenticate with the mediator.
+    let mut spawn_env = provider_env.clone();
+    if let Some(ref token) = mediator_root_token {
+        spawn_env.insert("MEDIATOR_TOKEN".into(), token.clone());
+    }
+
     #[cfg(target_os = "linux")]
     let mut handle = ProcessHandle::spawn(
         program,
@@ -685,7 +795,7 @@ pub async fn run_sandbox(
         &policy,
         netns.as_ref(),
         ca_file_paths.as_ref(),
-        &provider_env,
+        &spawn_env,
     )?;
 
     #[cfg(not(target_os = "linux"))]
@@ -696,7 +806,7 @@ pub async fn run_sandbox(
         interactive,
         &policy,
         ca_file_paths.as_ref(),
-        &provider_env,
+        &spawn_env,
     )?;
 
     // Store the entrypoint PID so the proxy can resolve TCP peer identity
@@ -802,6 +912,9 @@ pub async fn run_sandbox(
     };
 
     let status = result.into_diagnostic()?;
+
+    // Shut down the embedded mediator.
+    mediator_cancel.cancel();
 
     ocsf_emit!(
         ProcessActivityBuilder::new(ocsf_ctx())

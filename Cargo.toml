@@ -67,7 +67,7 @@ serde_json = "1"
 serde_yml = "0.0.12"
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 
 # WebSocket
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }

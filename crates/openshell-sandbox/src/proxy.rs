@@ -6,6 +6,9 @@
 use crate::denial_aggregator::DenialEvent;
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
+use crate::mediator::peercred;
+use crate::mediator::policy::convert::url_allowed_by_policy;
+use crate::mediator::registry::UidPolicyRegistry;
 use crate::opa::{NetworkAction, OpaEngine};
 use crate::policy::ProxyPolicy;
 use crate::secrets::{SecretResolver, rewrite_header_line};
@@ -22,7 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const MAX_HEADER_BYTES: usize = 8192;
 const INFERENCE_LOCAL_HOST: &str = "inference.local";
@@ -143,6 +146,7 @@ impl ProxyHandle {
         inference_ctx: Option<Arc<InferenceContext>>,
         secret_resolver: Option<Arc<SecretResolver>>,
         denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+        uid_registry: Option<UidPolicyRegistry>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -182,9 +186,10 @@ impl ProxyHandle {
                         let inf = inference_ctx.clone();
                         let resolver = secret_resolver.clone();
                         let dtx = denial_tx.clone();
+                        let ureg = uid_registry.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_tcp_connection(
-                                stream, opa, cache, spid, tls, inf, resolver, dtx,
+                                stream, opa, cache, spid, tls, inf, resolver, dtx, ureg,
                             )
                             .await
                             {
@@ -297,6 +302,7 @@ async fn handle_tcp_connection(
     inference_ctx: Option<Arc<InferenceContext>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+    uid_registry: Option<UidPolicyRegistry>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
@@ -375,9 +381,69 @@ async fn handle_tcp_connection(
     }
 
     let peer_addr = client.peer_addr().into_diagnostic()?;
-    let _local_addr = client.local_addr().into_diagnostic()?;
+    let local_addr = client.local_addr().into_diagnostic()?;
 
-    // Evaluate OPA policy with process-identity binding.
+    // Fast path: UID-based policy lookup via mediator registry.
+    // If the connecting process has a known UID in the registry, use the
+    // workflow's allowlist directly instead of expensive /proc scanning.
+    if let Some(ref registry) = uid_registry {
+        let local_port = local_addr.port();
+        let peer_port = peer_addr.port();
+        if let Some(cred) = peercred::tcp_peer_uid(local_port, peer_port) {
+            if let Some(net_policy) = registry.get(cred.uid) {
+                // CONNECT target is just host:port — check against allowlist
+                // patterns with both schemes and path variants. The allowlist
+                // may have patterns like "http://host:4000/*" which won't match
+                // the bare "http://host:4000" without a path.
+                let variants = [
+                    format!("https://{host_lc}:{port}"),
+                    format!("https://{host_lc}:{port}/"),
+                    format!("http://{host_lc}:{port}"),
+                    format!("http://{host_lc}:{port}/"),
+                    host_lc.clone(),
+                ];
+                let allowed = variants
+                    .iter()
+                    .any(|v| url_allowed_by_policy(v, &net_policy));
+                if allowed {
+                    debug!(
+                        uid = cred.uid,
+                        host = %host_lc,
+                        port,
+                        policy = %net_policy.policy_name,
+                        "UID registry: allowed"
+                    );
+                    // Proceed directly to relay — skip OPA/identity binding.
+                    client
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await
+                        .into_diagnostic()?;
+                    let mut upstream = TcpStream::connect((host_lc.as_str(), port))
+                        .await
+                        .into_diagnostic()?;
+                    tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                        .await
+                        .into_diagnostic()?;
+                    return Ok(());
+                } else {
+                    info!(
+                        uid = cred.uid,
+                        host = %host_lc,
+                        port,
+                        policy = %net_policy.policy_name,
+                        "UID registry: denied (not in allowlist)"
+                    );
+                    client
+                        .write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                        .await
+                        .into_diagnostic()?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // Slow path: OPA policy evaluation with process-identity binding.
     // Wrapped in spawn_blocking because identity resolution does heavy sync I/O:
     // /proc scanning + SHA256 hashing of binaries (e.g. node at 124MB).
     let opa_clone = opa_engine.clone();
@@ -662,6 +728,17 @@ async fn handle_tcp_connection(
             .map(|p| p.to_string_lossy().into_owned())
             .collect(),
         secret_resolver: secret_resolver.clone(),
+        content_registry: l7_config
+            .as_ref()
+            .and_then(|c| c.content_inspection.as_ref())
+            .map(|ci| {
+                Arc::new(crate::l7::content_inspect::ContentRuleRegistry::new(
+                    &ci.enabled_rules,
+                ))
+            }),
+        content_inspection: l7_config
+            .as_ref()
+            .and_then(|c| c.content_inspection.clone()),
     };
 
     if effective_tls_skip {
@@ -2114,6 +2191,8 @@ async fn handle_forward_proxy(
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
             secret_resolver: secret_resolver.clone(),
+            content_registry: None,
+            content_inspection: None,
         };
 
         let (target_path, query_params) = crate::l7::rest::parse_target_query(&path)
