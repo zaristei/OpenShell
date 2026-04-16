@@ -51,6 +51,21 @@ pub fn spawn_child_process(
             }
         }
     }
+    // Create shared results directory (world-writable) for file-based
+    // message passing between parent and children.
+    {
+        let results_dir = "/sandbox/.mediator/results";
+        let _ = std::fs::create_dir_all(results_dir);
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                results_dir,
+                std::fs::Permissions::from_mode(0o1777), // sticky + world-writable
+            );
+        }
+    }
+
     // Ensure intermediate policy dirs are world-traversable (o+x) so the
     // child UID can reach the workspace leaf directory.
     #[cfg(target_os = "linux")]
