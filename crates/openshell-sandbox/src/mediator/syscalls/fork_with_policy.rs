@@ -288,21 +288,16 @@ async fn materialize_compromises(pool: &SqlitePool, policy_name: &str, workflow_
     }
 }
 
-/// Create the instance directory structure for a workflow.
+/// Set up filesystem permissions for a workflow.
 ///
-/// On Linux, sets setgid bit and correct ownership. On other platforms, just
-/// creates the directory.
-// TODO: enforce external_mounts — iterate the policy's external_mounts and set
-// group permissions on each path based on mode (r → group-read, rw → group-readwrite,
-// rx → group-read-execute). Currently the mounts field is declared in the policy
-// schema and shown to the operator at approval time, but the daemon never actually
-// grants group access to those paths. Only the instance directory gets setgid + chown.
-// The plumbing is here (_gid, _external_mounts) — just needs the chmod/chgrp loop.
+/// 1. Creates the instance directory (if OPENSHELL_DATA_ROOT is set)
+/// 2. Enforces `external_mounts` — sets group permissions on each declared
+///    path so the child's GID can access them based on the mode field.
 fn setup_instance_dir(
     policy_name: &str,
     workflow_id: &str,
-    _gid: u32,
-    _external_mounts: &[crate::mediator::policy::ExternalMount],
+    gid: u32,
+    external_mounts: &[crate::mediator::policy::ExternalMount],
 ) {
     if let Some(data_root) = std::env::var_os("OPENSHELL_DATA_ROOT") {
         let instance_dir = std::path::PathBuf::from(data_root)
@@ -315,30 +310,93 @@ fn setup_instance_dir(
             return;
         }
 
-        // Create inbox subdirectory.
         let _ = std::fs::create_dir_all(instance_dir.join("inbox"));
 
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::PermissionsExt;
 
-            // Set setgid bit + group rwx on instance dir.
             let metadata = std::fs::metadata(&instance_dir);
             if let Ok(m) = metadata {
-                let mode = m.permissions().mode() | 0o2770; // setgid + rwxrwx---
+                let mode = m.permissions().mode() | 0o2770;
                 let _ = std::fs::set_permissions(
                     &instance_dir,
                     std::fs::Permissions::from_mode(mode),
                 );
             }
 
-            // chown to gid.
             unsafe {
                 let path_c = std::ffi::CString::new(
                     instance_dir.to_str().unwrap_or_default(),
                 )
                 .unwrap_or_default();
-                libc::chown(path_c.as_ptr(), u32::MAX, _gid); // -1 for uid = keep owner
+                libc::chown(path_c.as_ptr(), u32::MAX, gid);
+            }
+        }
+    }
+
+    // Enforce external_mounts: set group ownership and permissions on each
+    // declared path so the child's GID can access them.
+    #[cfg(target_os = "linux")]
+    {
+        for mount in external_mounts {
+            let path = std::path::Path::new(&mount.path);
+
+            // Create the path if it doesn't exist and mode includes write.
+            if mount.mode.contains('w') {
+                if let Err(e) = std::fs::create_dir_all(path) {
+                    tracing::warn!(
+                        path = %mount.path, %e,
+                        "failed to create mount path"
+                    );
+                    continue;
+                }
+            }
+
+            if !path.exists() {
+                tracing::warn!(
+                    path = %mount.path,
+                    "external_mount path does not exist, skipping"
+                );
+                continue;
+            }
+
+            // chgrp to the child's GID.
+            unsafe {
+                let path_c = std::ffi::CString::new(mount.path.as_str())
+                    .unwrap_or_default();
+                if libc::chown(path_c.as_ptr(), u32::MAX, gid) != 0 {
+                    tracing::warn!(
+                        path = %mount.path, gid,
+                        "failed to chgrp mount path"
+                    );
+                    continue;
+                }
+            }
+
+            // Set group permissions based on mode.
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(m) = std::fs::metadata(path) {
+                let current = m.permissions().mode();
+                let group_bits = match mount.mode.as_str() {
+                    "r" => 0o040,          // group read
+                    "rw" => 0o060,         // group read + write
+                    "rx" => 0o050,         // group read + execute
+                    "rwx" => 0o070,        // group read + write + execute
+                    "w" => 0o020,          // group write
+                    _ => 0o040,            // default: group read
+                };
+                let new_mode = (current & !0o070) | group_bits; // replace group bits
+                let _ = std::fs::set_permissions(
+                    path,
+                    std::fs::Permissions::from_mode(new_mode),
+                );
+                tracing::info!(
+                    path = %mount.path,
+                    mode = %mount.mode,
+                    gid,
+                    "enforced external_mount permissions"
+                );
             }
         }
     }
