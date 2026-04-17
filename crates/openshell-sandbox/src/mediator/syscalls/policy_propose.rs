@@ -166,9 +166,19 @@ pub async fn handle_policy_propose(
         }
     }
 
+    // Read webhook_secret from config file if not passed at boot (same
+    // boot-ordering fix as APPROVAL_BRIDGE_URL).
+    let runtime_secret: Option<String> = webhook_secret.map(String::from).or_else(|| {
+        std::fs::read_to_string("/sandbox/.mediator/config.json")
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|c| c.get("WEBHOOK_SECRET")?.as_str().map(String::from))
+            .filter(|s| !s.is_empty())
+    });
+
     info!(proposal_id = %proposal_id, policy = %params.config.policy_name, "sending policy proposal to approval bridge");
 
-    super::post_to_bridge(&client, &webhook_url, &payload, webhook_secret).await?;
+    super::post_to_bridge(&client, &webhook_url, &payload, runtime_secret.as_deref()).await?;
 
     // Poll for decision.
     let poll_url = format!("{bridge_url}/policy-decisions");
