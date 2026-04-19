@@ -6,6 +6,9 @@
 use crate::denial_aggregator::DenialEvent;
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
+use crate::mediator::peercred;
+use crate::mediator::policy::convert::url_allowed_by_policy;
+use crate::mediator::registry::UidPolicyRegistry;
 use crate::opa::{NetworkAction, OpaEngine};
 use crate::policy::ProxyPolicy;
 use crate::secrets::{SecretResolver, rewrite_header_line};
@@ -23,7 +26,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const MAX_HEADER_BYTES: usize = 8192;
 const INFERENCE_LOCAL_HOST: &str = "inference.local";
@@ -150,6 +153,7 @@ impl ProxyHandle {
         inference_ctx: Option<Arc<InferenceContext>>,
         secret_resolver: Option<Arc<SecretResolver>>,
         denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+        uid_registry: Option<UidPolicyRegistry>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -189,9 +193,10 @@ impl ProxyHandle {
                         let inf = inference_ctx.clone();
                         let resolver = secret_resolver.clone();
                         let dtx = denial_tx.clone();
+                        let ureg = uid_registry.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_tcp_connection(
-                                stream, opa, cache, spid, tls, inf, resolver, dtx,
+                                stream, opa, cache, spid, tls, inf, resolver, dtx, ureg,
                             )
                             .await
                             {
@@ -295,6 +300,7 @@ fn emit_denial_simple(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_tcp_connection(
     mut client: TcpStream,
     opa_engine: Arc<OpaEngine>,
@@ -304,6 +310,7 @@ async fn handle_tcp_connection(
     inference_ctx: Option<Arc<InferenceContext>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+    uid_registry: Option<UidPolicyRegistry>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
@@ -382,9 +389,86 @@ async fn handle_tcp_connection(
     }
 
     let peer_addr = client.peer_addr().into_diagnostic()?;
-    let _local_addr = client.local_addr().into_diagnostic()?;
+    let local_addr = client.local_addr().into_diagnostic()?;
 
-    // Evaluate OPA policy with process-identity binding.
+    // Mediator fast path: UID-based policy lookup via the mediator registry.
+    // When the connecting process is a forked child workflow (registered
+    // UID), use its MediationPolicy's http_allowlist directly instead of
+    // running the OPA identity-binding pipeline. The base OPA policy still
+    // covers init and other unregistered processes via the slow path below.
+    if let Some(ref registry) = uid_registry {
+        let local_port = local_addr.port();
+        let peer_port = peer_addr.port();
+        if let Some(cred) = peercred::tcp_peer_uid(local_port, peer_port) {
+            if let Some(net_policy) = registry.get(cred.uid) {
+                // CONNECT target is `host:port`. Allowlist patterns may include
+                // the port (`https://host:4000/*`) or omit it for default ports
+                // (`https://host/*`). Check both forms plus the bare host so
+                // common pattern styles all match.
+                let mut variants = vec![
+                    format!("https://{host_lc}:{port}"),
+                    format!("https://{host_lc}:{port}/"),
+                    format!("http://{host_lc}:{port}"),
+                    format!("http://{host_lc}:{port}/"),
+                    host_lc.clone(),
+                ];
+                if port == 443 {
+                    variants.push(format!("https://{host_lc}"));
+                    variants.push(format!("https://{host_lc}/"));
+                }
+                if port == 80 {
+                    variants.push(format!("http://{host_lc}"));
+                    variants.push(format!("http://{host_lc}/"));
+                }
+                let allowed = variants
+                    .iter()
+                    .any(|v| url_allowed_by_policy(v, &net_policy));
+                if allowed {
+                    debug!(
+                        uid = cred.uid,
+                        host = %host_lc,
+                        port,
+                        policy = %net_policy.policy_name,
+                        "mediator fast path: allowed"
+                    );
+                    client
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await
+                        .into_diagnostic()?;
+                    let mut upstream = TcpStream::connect((host_lc.as_str(), port))
+                        .await
+                        .into_diagnostic()?;
+                    tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                        .await
+                        .into_diagnostic()?;
+                    return Ok(());
+                }
+                info!(
+                    uid = cred.uid,
+                    host = %host_lc,
+                    port,
+                    policy = %net_policy.policy_name,
+                    "mediator fast path: denied (not in allowlist)"
+                );
+                respond(
+                    &mut client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "policy_denied",
+                        &format!(
+                            "CONNECT {host_lc}:{port} not permitted by mediator policy '{}'",
+                            net_policy.policy_name
+                        ),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    }
+
+    // Slow path: OPA policy evaluation with process-identity binding.
     // Wrapped in spawn_blocking because identity resolution does heavy sync I/O:
     // /proc scanning + SHA256 hashing of binaries (e.g. node at 124MB).
     let opa_clone = opa_engine.clone();
