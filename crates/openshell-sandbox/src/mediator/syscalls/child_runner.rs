@@ -65,6 +65,32 @@ pub fn spawn_child_process(
         }
     }
 
+    // Wizard workflows get the shared wizard AGENTS.md symlinked into their
+    // instance dir so `openclaw agent --local` reads it from cwd on
+    // startup. The source document lives at /opt/wizard-agent/AGENTS.md
+    // (shipped in the NemoClaw sandbox image). Silent no-op when the file
+    // isn't present — deployments that don't bundle the wizard continue
+    // to work (the wizard just runs without its system prompt, which will
+    // degrade its output quality but not crash anything).
+    if policy_name == "wizard_v1" {
+        let agents_md_target = "/opt/wizard-agent/AGENTS.md";
+        let agents_md_link = format!("{instance_dir}/AGENTS.md");
+        if std::path::Path::new(agents_md_target).exists() {
+            // Remove any stale link from a prior fork of the same workflow_id.
+            let _ = std::fs::remove_file(&agents_md_link);
+            #[cfg(target_os = "linux")]
+            if let Err(e) = std::os::unix::fs::symlink(agents_md_target, &agents_md_link) {
+                warn!(workflow_id, target = agents_md_target, link = %agents_md_link, %e,
+                    "failed to symlink wizard AGENTS.md (wizard will run without its system prompt)");
+            } else {
+                info!(workflow_id, "wizard AGENTS.md symlinked into workflow instance dir");
+            }
+        } else {
+            warn!(workflow_id, target = agents_md_target,
+                "wizard AGENTS.md not found at expected path; wizard invocation will lack its system prompt");
+        }
+    }
+
     let (program, args): (String, Vec<String>) = if command.is_empty() {
         ("/bin/sh".into(), vec!["-c".into(), "exec sleep infinity".into()])
     } else {
