@@ -99,10 +99,25 @@ pub async fn bootstrap(config: &MediatorConfig) -> Result<BootstrapResult, Strin
     };
     let token_key = TokenKey::new(key_bytes);
 
-    // 3. Create init_v0 policy.
+    // 3. Seed pre-approved system policies.
+    //
+    // init_v0      — root coordinator, present in every deployment
+    // wizard_v1    — on-demand policy wizard, invokable by any caller whose
+    //                own policy admits wizard_v1 in allowed_child_policies
+    // initial_agent_policy_v1 — operator-picked default subset, optional;
+    //                loaded from disk when NemoClaw's onboarding wrote it
     let init_policy = create_init_policy(config.init_inference_endpoint.as_deref());
+    let wizard_policy = create_wizard_policy(config.init_inference_endpoint.as_deref());
     let mut policies = HashMap::new();
     policies.insert("init_v0".into(), init_policy);
+    policies.insert("wizard_v1".into(), wizard_policy);
+    if let Some(iap) = load_initial_agent_policy() {
+        info!(
+            policy = %iap.policy_name,
+            "loaded initial_agent_policy_v1 from /sandbox/.mediator/initial_agent_policy.yaml"
+        );
+        policies.insert("initial_agent_policy_v1".into(), iap);
+    }
 
     // 4. Generate root workflow token.
     let pid = std::process::id();
@@ -211,8 +226,17 @@ pub async fn bootstrap_embedded(
     let token_key = TokenKey::new(key_bytes);
 
     let init_policy = create_init_policy(config.init_inference_endpoint.as_deref());
+    let wizard_policy = create_wizard_policy(config.init_inference_endpoint.as_deref());
     let mut policies = HashMap::new();
     policies.insert("init_v0".into(), init_policy);
+    policies.insert("wizard_v1".into(), wizard_policy);
+    if let Some(iap) = load_initial_agent_policy() {
+        info!(
+            policy = %iap.policy_name,
+            "loaded initial_agent_policy_v1 from /sandbox/.mediator/initial_agent_policy.yaml"
+        );
+        policies.insert("initial_agent_policy_v1".into(), iap);
+    }
 
     let pid = std::process::id();
     let timestamp = SystemTime::now()
@@ -317,6 +341,78 @@ fn create_init_policy(inference_endpoint: Option<&str>) -> MediationPolicy {
     }
 }
 
+/// Create the `wizard_v1` system policy — the "policy wizard" consultation
+/// profile. The wizard is a lean OpenClaw agent whose only outputs are
+/// drafted policy YAML + rationale; it reads sandbox + preset context and
+/// calls LiteLLM for reasoning. It runs on demand: any workflow whose own
+/// policy admits `wizard_v1` in its `allowed_child_policies` may invoke it
+/// via `fork_with_policy(wizard_v1, ...)`.
+///
+/// Restrictions:
+/// - HTTP: LiteLLM only (same endpoint as init)
+/// - Filesystem: uses the sandbox's baseline Landlock for reads; its own
+///   workspace under `/sandbox/.mediator/policies/wizard_v1/workspace/`
+///   via the per-policy GID carving in `setup_instance_dir`
+/// - No bind ports, no signal targets, no child policies of its own
+/// - Launch command gated to the openclaw wizard profile so the wizard
+///   can't be hijacked to run arbitrary programs
+fn create_wizard_policy(inference_endpoint: Option<&str>) -> MediationPolicy {
+    let http_allowlist = match inference_endpoint {
+        Some(endpoint) => vec![endpoint.to_string()],
+        None => vec![],
+    };
+    MediationPolicy {
+        policy_name: "wizard_v1".into(),
+        rationale: "Policy wizard — read-only sandbox visibility, LiteLLM only; drafts subset-policy proposals on operator request."
+            .into(),
+        http_allowlist,
+        external_mounts: vec![],
+        allowed_child_policies: vec![],
+        bind_ports: None,
+        allowed_ipc_targets: vec![],
+        allowed_signal_targets: vec![],
+        allowed_launch_commands: vec![
+            // Restrict wizard to the openclaw agent runtime with its own
+            // profile. Exact command shape depends on how NemoClaw wires
+            // the wizard agent definition; we accept any openclaw agent
+            // invocation and rely on the agent profile at runtime to
+            // enforce the wizard behavior.
+            "openclaw agent *".into(),
+        ],
+    }
+}
+
+/// Load an optional `initial_agent_policy_v1` from disk. Written by
+/// NemoClaw's onboarding flow when the operator picks the default agent's
+/// subset of the sandbox ceiling. When absent, the bootstrap does not
+/// preload an initial-agent policy; the sandbox entrypoint is responsible
+/// for either running directly under `init_v0` (today's behavior) or
+/// calling `policy_propose` to register something at runtime.
+///
+/// File location: `/sandbox/.mediator/initial_agent_policy.yaml` (same
+/// format as any other `MediationPolicy` YAML).
+fn load_initial_agent_policy() -> Option<MediationPolicy> {
+    let path = "/sandbox/.mediator/initial_agent_policy.yaml";
+    let body = std::fs::read_to_string(path).ok()?;
+    match serde_yml::from_str::<MediationPolicy>(&body) {
+        Ok(policy) => {
+            if policy.policy_name != "initial_agent_policy_v1" {
+                tracing::warn!(
+                    path,
+                    found = %policy.policy_name,
+                    "initial_agent_policy.yaml policy_name must be 'initial_agent_policy_v1'; ignoring"
+                );
+                return None;
+            }
+            Some(policy)
+        }
+        Err(err) => {
+            tracing::warn!(path, %err, "failed to parse initial_agent_policy.yaml; ignoring");
+            None
+        }
+    }
+}
+
 /// Run the mediator daemon end-to-end: bootstrap then serve.
 ///
 /// This is the primary public entry point for launching the mediator.
@@ -403,6 +499,45 @@ mod tests {
         // No bind_ports, no sensitive mounts.
         assert!(init.bind_ports.is_none());
         assert!(init.external_mounts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_preloads_wizard_v1() {
+        // wizard_v1 is a system policy present in every deployment — any
+        // caller whose policy admits wizard_v1 in allowed_child_policies
+        // can fork it to draft subset proposals.
+        let config = MediatorConfig {
+            init_inference_endpoint: Some("http://litellm.test:4000/*".into()),
+            ..test_config()
+        };
+        let result = bootstrap(&config).await.unwrap();
+        let policies = result.daemon.context().policies.read().await;
+        let wizard = policies.get("wizard_v1").expect("wizard_v1 should be preloaded");
+
+        // LLM endpoint only.
+        assert_eq!(wizard.http_allowlist.len(), 1);
+        assert!(wizard.http_allowlist[0].contains("litellm"));
+
+        // No mounts, no network binding, no children, no signal targets.
+        assert!(wizard.external_mounts.is_empty());
+        assert!(wizard.allowed_child_policies.is_empty());
+        assert!(wizard.bind_ports.is_none());
+        assert!(wizard.allowed_signal_targets.is_empty());
+
+        // Launch gated to openclaw agent.
+        assert_eq!(wizard.allowed_launch_commands.len(), 1);
+        assert!(wizard.allowed_launch_commands[0].starts_with("openclaw agent"));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_skips_initial_agent_policy_when_file_absent() {
+        // No /sandbox/.mediator/initial_agent_policy.yaml in the test env →
+        // load_initial_agent_policy returns None; the HashMap doesn't contain
+        // initial_agent_policy_v1. Sandbox entrypoints that need one must
+        // either pre-populate the file at onboarding or use init_v0.
+        let result = bootstrap(&test_config()).await.unwrap();
+        let policies = result.daemon.context().policies.read().await;
+        assert!(policies.get("initial_agent_policy_v1").is_none());
     }
 
     #[tokio::test]
