@@ -216,12 +216,87 @@ pub async fn handle_fork_with_policy(
         }
     }
 
+    // 14. Fire-and-forget fork notification to the approval bridge's runtime
+    // channel. Bridge reads {APPROVAL_BRIDGE_URL, WEBHOOK_SECRET} from the
+    // mediator config file (same pattern policy_propose uses for runtime
+    // bridge discovery). Task runs detached — fork success doesn't depend
+    // on the bridge being reachable. Bridge receives `event="mediator_fork"`
+    // and posts to the runtime_bot Telegram channel as an info message.
+    spawn_fork_notification(
+        params.workflow_id.clone(),
+        policy_name_for_spawn.clone(),
+        uid,
+        caller_token.workflow_id.clone(),
+        caller_policy.policy_name.clone(),
+        params.command.clone(),
+    );
+
     Ok(ForkResult {
         uid,
         gid: policy_gid,
         workflow_token: token_value.into_string(),
         inherited_from,
     })
+}
+
+/// Spawn a detached task that POSTs a `mediator_fork` event to the
+/// approval bridge. Discovers the bridge URL + webhook secret by reading
+/// `/sandbox/.mediator/config.json` at call time (same pattern as
+/// `policy_propose`), which accommodates the boot-ordering where the
+/// config file is written after the mediator starts. Silent no-op when
+/// the bridge isn't configured.
+fn spawn_fork_notification(
+    child_workflow_id: String,
+    child_policy: String,
+    child_uid: u32,
+    caller_workflow_id: String,
+    caller_policy: String,
+    command: Vec<String>,
+) {
+    tokio::spawn(async move {
+        let config: Option<serde_json::Value> =
+            std::fs::read_to_string("/sandbox/.mediator/config.json")
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok());
+        let bridge_url = config
+            .as_ref()
+            .and_then(|c| c.get("APPROVAL_BRIDGE_URL"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let webhook_secret = config
+            .as_ref()
+            .and_then(|c| c.get("WEBHOOK_SECRET"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let Some(url) = bridge_url else {
+            return;
+        };
+
+        let payload = serde_json::json!({
+            "event": "mediator_fork",
+            "workflow_id": child_workflow_id,
+            "policy_name": child_policy,
+            "uid": child_uid,
+            "caller_workflow_id": caller_workflow_id,
+            "caller_policy": caller_policy,
+            "command": command,
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .ok();
+        let Some(client) = client else { return };
+        let target = format!("{url}/webhook");
+        if let Err(e) =
+            super::post_to_bridge(&client, &target, &payload, webhook_secret.as_deref()).await
+        {
+            // Non-fatal — fork already succeeded; notification is telemetry.
+            tracing::debug!(%e, url = %target, "fork notification to approval bridge failed");
+        }
+    });
 }
 
 /// Materialize pre-computed compromised resources from the policy_taint table.
