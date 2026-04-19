@@ -26,12 +26,16 @@ use tracing::{info, warn};
 pub struct ForkParams {
     pub workflow_id: String,
     pub policy_name: String,
-    pub inherit: bool,
     #[serde(default)]
     pub command: Vec<String>,
 }
 
 /// Successful result of `fork_with_policy`.
+///
+/// `inherited_from` is retained in the wire schema for backward compatibility
+/// with stored `WorkflowToken` rows and external clients that deserialize it,
+/// but the simplified mediator never populates it — every child policy
+/// subset-checks against the live sandbox policy directly, not a parent.
 #[derive(Debug, serde::Serialize)]
 pub struct ForkResult {
     pub uid: u32,
@@ -66,27 +70,24 @@ pub async fn handle_fork_with_policy(
         .get(&params.policy_name)
         .ok_or_else(|| format!("policy '{}' not found", params.policy_name))?;
 
-    // 2. Check caller's allowed_child_policies.
-    let child_ref = caller_policy
+    // 2. Check caller's allowed_child_policies (fnmatch on patterns).
+    //
+    // Every entry in caller_policy.allowed_child_policies is a glob pattern
+    // (e.g. "web_fetcher_v*") matched against the target policy's name.
+    // Missing match → auto-deny; the caller's policy authoring is the gate
+    // that decides what children this policy-class may spawn.
+    let allowed = caller_policy
         .allowed_child_policies
         .iter()
-        .find(|c| fnmatch(&c.policy_name, &params.policy_name))
-        .ok_or_else(|| {
-            format!(
-                "policy '{}' is not in caller's allowed_child_policies",
-                params.policy_name
-            )
-        })?;
-
-    // 3. Verify inherit flag matches.
-    if params.inherit != child_ref.inherit {
+        .any(|pattern| fnmatch(pattern, &params.policy_name));
+    if !allowed {
         return Err(format!(
-            "inherit mismatch: caller declares inherit={} for '{}', request says inherit={}",
-            child_ref.inherit, params.policy_name, params.inherit
+            "policy '{}' is not in caller's allowed_child_policies (caller_policy='{}', patterns={:?})",
+            params.policy_name, caller_policy.policy_name, caller_policy.allowed_child_policies
         ));
     }
 
-    // 3b. Validate command against allowed_launch_commands.
+    // 3. Validate command against allowed_launch_commands.
     if !_target_policy.allowed_launch_commands.is_empty() && !params.command.is_empty() {
         let command_str = params.command.join(" ");
         let allowed = _target_policy
@@ -126,11 +127,10 @@ pub async fn handle_fork_with_policy(
 
     let token_value = token_key.generate(&params.workflow_id, uid, &timestamp);
 
-    let inherited_from = if params.inherit {
-        Some(caller_token.token.clone())
-    } else {
-        None
-    };
+    // Inheritance was dropped; the column is retained in the DB for schema
+    // compat but always NULL in the simplified mediator.
+    let _ = caller_token;
+    let inherited_from: Option<String> = None;
 
     // Save policy_name before it's moved into the workflow record.
     let policy_name_for_spawn = params.policy_name.clone();
@@ -165,13 +165,12 @@ pub async fn handle_fork_with_policy(
         .map_err(|e| format!("failed to insert workflow: {e}"))?;
 
     // 11. Register UID→policy in the proxy registry.
-    // Resolve effective policy (with inheritance) for the proxy.
+    //
+    // The child's own policy is authoritative — inheritance was removed and
+    // every proposed policy subset-checks against the sandbox directly at
+    // propose time, so there's nothing to merge here.
+    let _ = &caller_policy;
     {
-        // Inheritance was dropped from the simplified mediator — the
-        // `params.inherit` field and `caller_token.inherited_from` remain on
-        // the wire for backward compatibility but are ignored. The child's
-        // own policy is the only source of network truth.
-        let _ = (params.inherit, &caller_token, &caller_policy);
         let policies_guard = policies.read().await;
         if let Some(cp) = policies_guard.get(&workflow.policy_name) {
             let net_policy = convert::from_mediation_policy(cp, &params.workflow_id);
@@ -400,7 +399,7 @@ fn setup_instance_dir(
 mod tests {
     use super::*;
     use crate::mediator::auth::TokenKey;
-    use crate::mediator::policy::{ChildPolicyRef, MediationPolicy};
+    use crate::mediator::policy::MediationPolicy;
     use crate::mediator::store::MediatorStore;
     use crate::mediator::store::queries::insert_token;
     use tokio::sync::RwLock;
@@ -417,14 +416,11 @@ mod tests {
                 rationale: "parent".into(),
                 http_allowlist: vec!["*".into()],
                 external_mounts: vec![],
-                allowed_child_policies: vec![ChildPolicyRef {
-                    policy_name: "child_*".into(),
-                    inherit: true,
-                }],
+                allowed_child_policies: vec!["child_*".into()],
                 bind_ports: None,
-                allowed_ipc_targets: vec!["*".into()],
+                allowed_ipc_targets: vec![],
                 allowed_signal_targets: vec![],
-            allowed_launch_commands: vec![],
+                allowed_launch_commands: vec![],
             },
         );
         m.insert(
@@ -438,7 +434,7 @@ mod tests {
                 bind_ports: None,
                 allowed_ipc_targets: vec![],
                 allowed_signal_targets: vec![],
-            allowed_launch_commands: vec![],
+                allowed_launch_commands: vec![],
             },
         );
         m
@@ -474,7 +470,6 @@ mod tests {
             ForkParams {
                 workflow_id: "wf_child_1".into(),
                 policy_name: "child_v1".into(),
-                inherit: true,
                 command: vec![],
             },
             &uid_alloc,
@@ -488,7 +483,8 @@ mod tests {
         assert_eq!(result.uid, 100_000);
         assert_eq!(result.gid, 70_000);
         assert!(!result.workflow_token.is_empty());
-        assert_eq!(result.inherited_from.as_deref(), Some("tok_parent"));
+        // Inheritance dropped — inherited_from is always None in the simplified mediator.
+        assert!(result.inherited_from.is_none());
 
         // Verify token is in store.
         let stored = queries::get_token(store.pool(), &result.workflow_token)
@@ -538,7 +534,7 @@ mod tests {
             ForkParams {
                 workflow_id: "wf_bad".into(),
                 policy_name: "parent_v1".into(),
-                inherit: true,
+
                 command: vec![],
             },
             &uid_alloc,
@@ -552,49 +548,9 @@ mod tests {
         assert!(err.contains("not in caller's allowed_child_policies"));
     }
 
-    #[tokio::test]
-    async fn fork_rejects_inherit_mismatch() {
-        let store = MediatorStore::open("sqlite::memory:").await.unwrap();
-        let key = TokenKey::new(b"k".to_vec());
-        let policies = Arc::new(RwLock::new(make_policies()));
-        let uid_alloc = UidAllocator::new();
-        let gid_alloc = GidAllocator::new();
-
-        let caller_tok = WorkflowToken {
-            token: "tok_p2".into(),
-            workflow_id: "wf_p2".into(),
-            pid: 1,
-            policy_name: "parent_v1".into(),
-            inherited_from: None,
-            created_at: "t".into(),
-            uid: None,
-        };
-        insert_token(store.pool(), &caller_tok).await.unwrap();
-
-        let caller_policy = policies.read().await.get("parent_v1").unwrap().clone();
-
-        let err = handle_fork_with_policy(
-            store.pool(),
-            &key,
-            &policies,
-            &caller_tok,
-            &caller_policy,
-            ForkParams {
-                workflow_id: "wf_mm".into(),
-                policy_name: "child_v1".into(),
-                inherit: false,
-                command: vec![],
-            },
-            &uid_alloc,
-            &gid_alloc,
-            &UidPolicyRegistry::new(),
-                TEST_PROXY_ADDR,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(err.contains("inherit mismatch"));
-    }
+    // fork_rejects_inherit_mismatch removed — the `inherit` field was dropped
+    // from ForkParams in the simplified mediator. See fork_rejects_unlisted_child
+    // above for the remaining allowed_child_policies enforcement test.
 
     #[tokio::test]
     async fn fork_allocates_unique_uids() {
@@ -619,14 +575,14 @@ mod tests {
 
         let r1 = handle_fork_with_policy(
             store.pool(), &key, &policies, &caller_tok, &caller_policy,
-            ForkParams { workflow_id: "wf_a".into(), policy_name: "child_v1".into(), inherit: true, command: vec![] },
+            ForkParams { workflow_id: "wf_a".into(), policy_name: "child_v1".into(), command: vec![] },
             &uid_alloc, &gid_alloc, &UidPolicyRegistry::new(),
                 TEST_PROXY_ADDR,
         ).await.unwrap();
 
         let r2 = handle_fork_with_policy(
             store.pool(), &key, &policies, &caller_tok, &caller_policy,
-            ForkParams { workflow_id: "wf_b".into(), policy_name: "child_v1".into(), inherit: true, command: vec![] },
+            ForkParams { workflow_id: "wf_b".into(), policy_name: "child_v1".into(), command: vec![] },
             &uid_alloc, &gid_alloc, &UidPolicyRegistry::new(),
                 TEST_PROXY_ADDR,
         ).await.unwrap();

@@ -6,7 +6,7 @@
 use super::auth::TokenKey;
 use super::daemon::{DaemonConfig, MediatorDaemon};
 use super::policy::trust_spec::TrustSpec;
-use super::policy::{ChildPolicyRef, MediationPolicy, PortRange, SignalTarget};
+use super::policy::{MediationPolicy, PortRange, SignalTarget};
 use super::store::MediatorStore;
 use super::store::queries;
 use super::store::schema::WorkflowToken;
@@ -297,12 +297,9 @@ fn create_init_policy(inference_endpoint: Option<&str>) -> MediationPolicy {
         rationale: "Root coordinator — inference only via sensitive-tier LiteLLM. Forks children for web access.".into(),
         http_allowlist,
         external_mounts: vec![],
-        allowed_child_policies: vec![ChildPolicyRef {
-            policy_name: "*".into(),
-            inherit: true,
-        }],
+        allowed_child_policies: vec!["*".into()],
         bind_ports: None,
-        allowed_ipc_targets: vec!["*".into()],
+        allowed_ipc_targets: vec![],
         allowed_signal_targets: vec![SignalTarget {
             policy_name: "*".into(),
             signals: vec!["term".into(), "kill".into(), "stop".into(), "cont".into()],
@@ -387,11 +384,10 @@ mod tests {
         // Init has NO HTTP — forks children for web access.
         assert!(init.http_allowlist.is_empty(), "init should have no HTTP access");
 
-        // Init has wildcard child/IPC/signal for coordination.
-        assert_eq!(init.allowed_child_policies.len(), 1);
-        assert_eq!(init.allowed_child_policies[0].policy_name, "*");
-        assert_eq!(init.allowed_ipc_targets.len(), 1);
-        assert_eq!(init.allowed_ipc_targets[0].policy_pattern(), "*");
+        // Init has wildcard child/signal for coordination. IPC targets are
+        // retained in the schema for compat but unused at runtime.
+        assert_eq!(init.allowed_child_policies, vec!["*".to_string()]);
+        assert!(init.allowed_ipc_targets.is_empty());
         assert_eq!(init.allowed_signal_targets[0].policy_name, "*");
         assert_eq!(init.allowed_signal_targets[0].signals.len(), 4);
 

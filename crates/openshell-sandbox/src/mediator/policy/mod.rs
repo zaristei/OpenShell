@@ -29,9 +29,13 @@ pub struct MediationPolicy {
     #[serde(default)]
     pub external_mounts: Vec<ExternalMount>,
 
-    /// Policies that this one may fork into child namespaces.
+    /// Policies that this one may fork into. Entries are fnmatch-style
+    /// patterns matched against the target policy's name at
+    /// `fork_with_policy` time. Globs let proposals cover future policy
+    /// versions: e.g. `"web_fetcher_v*"` admits `web_fetcher_v1`,
+    /// `web_fetcher_v2`, etc. An empty list forbids all child forks.
     #[serde(default)]
-    pub allowed_child_policies: Vec<ChildPolicyRef>,
+    pub allowed_child_policies: Vec<String>,
 
     /// Inclusive port range for `request_port` `[min, max]`.
     #[serde(default)]
@@ -68,14 +72,6 @@ pub struct ExternalMount {
     pub mode: String,
 }
 
-/// Reference to a child policy that may be forked.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ChildPolicyRef {
-    /// Name or wildcard pattern for the child policy.
-    pub policy_name: String,
-    /// Whether the child inherits the parent's policy constraints.
-    pub inherit: bool,
-}
 
 /// Inclusive port range.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -184,8 +180,8 @@ external_mounts:
   - path: "/usr/bin"
     mode: "rx"
 allowed_child_policies:
-  - policy_name: "fetcher_v1"
-    inherit: true
+  - "fetcher_v1"
+  - "scrubber_*"
 bind_ports: [8080, 8099]
 allowed_ipc_targets:
   - "fetcher_*"
