@@ -13,6 +13,7 @@ mod identity;
 pub mod l7;
 pub mod log_push;
 pub mod mechanistic_mapper;
+pub mod mediator;
 pub mod opa;
 mod policy;
 mod process;
