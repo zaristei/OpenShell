@@ -80,10 +80,12 @@ impl MediatorDaemon {
             None,
             trust_spec,
             UidPolicyRegistry::new(),
+            Vec::new(),
         )
     }
 
     /// Create a new daemon with shared UID policy registry (for embedded mode).
+    #[allow(clippy::too_many_arguments)]
     pub fn with_shared_registry(
         store: MediatorStore,
         token_key: TokenKey,
@@ -93,6 +95,7 @@ impl MediatorDaemon {
         webhook_secret: Option<String>,
         trust_spec: Option<Arc<TrustSpec>>,
         uid_policy_registry: UidPolicyRegistry,
+        sandbox_fs_paths: Vec<PathBuf>,
     ) -> Self {
         let proxy_addr = config.proxy_addr;
         let ctx = Arc::new(SyscallContext {
@@ -106,6 +109,7 @@ impl MediatorDaemon {
             gid_allocator: Arc::new(GidAllocator::new()),
             uid_policy_registry,
             proxy_addr,
+            sandbox_fs_paths,
         });
         Self { ctx, config }
     }

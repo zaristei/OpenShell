@@ -43,6 +43,12 @@ pub struct MediatorConfig {
     /// L7 proxy address. Passed to iptables rules so child UIDs route
     /// through the correct proxy address (e.g. `10.200.0.1:3128` in netns).
     pub proxy_addr: std::net::SocketAddr,
+    /// Filesystem paths the sandbox's `SandboxPolicy` allows (union of
+    /// `read_only` + `read_write`). Used by `policy_propose` to subset-check
+    /// proposed child `external_mounts` against the sandbox's ceiling: a
+    /// mount is admissible iff its absolute path is a subpath of one of
+    /// these. Empty vec → no filesystem subset check runs (permissive).
+    pub sandbox_fs_paths: Vec<PathBuf>,
 }
 
 impl Default for MediatorConfig {
@@ -56,6 +62,7 @@ impl Default for MediatorConfig {
             trust_spec_path: None,
             init_inference_endpoint: None,
             proxy_addr: ([127, 0, 0, 1], 3128).into(),
+            sandbox_fs_paths: Vec::new(),
         }
     }
 }
@@ -160,6 +167,7 @@ pub async fn bootstrap(config: &MediatorConfig) -> Result<BootstrapResult, Strin
         config.webhook_secret.clone(),
         trust_spec,
         super::registry::UidPolicyRegistry::new(),
+        config.sandbox_fs_paths.clone(),
     );
 
     Ok(BootstrapResult {
@@ -249,6 +257,7 @@ pub async fn bootstrap_embedded(
         config.webhook_secret.clone(),
         trust_spec,
         registry,
+        config.sandbox_fs_paths.clone(),
     );
 
     Ok(BootstrapResult {

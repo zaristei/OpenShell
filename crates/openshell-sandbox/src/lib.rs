@@ -552,6 +552,17 @@ pub async fn run_sandbox(
         let trust_spec_path = cfg_str("MEDIATOR_TRUST_SPEC").map(std::path::PathBuf::from);
         let init_inference_endpoint = cfg_str("INIT_INFERENCE_ENDPOINT");
 
+        // Seed the mediator's subset-check ceiling with the live sandbox
+        // FilesystemPolicy. Child policies' `external_mounts` must be
+        // subpaths of one of these, enforced at `policy_propose` time.
+        let sandbox_fs_paths: Vec<std::path::PathBuf> = policy
+            .filesystem
+            .read_only
+            .iter()
+            .chain(policy.filesystem.read_write.iter())
+            .cloned()
+            .collect();
+
         let config = mediator::MediatorConfig {
             socket_path: std::path::PathBuf::from(&mediator_socket),
             db_path: mediator_db,
@@ -561,6 +572,7 @@ pub async fn run_sandbox(
             trust_spec_path,
             init_inference_endpoint,
             proxy_addr,
+            sandbox_fs_paths,
         };
 
         match mediator::init::bootstrap_embedded(&config, uid_registry.clone()).await {

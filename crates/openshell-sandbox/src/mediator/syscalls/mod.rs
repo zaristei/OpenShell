@@ -48,6 +48,11 @@ pub struct SyscallContext {
     pub uid_policy_registry: UidPolicyRegistry,
     /// L7 proxy address for iptables rules.
     pub proxy_addr: std::net::SocketAddr,
+    /// Filesystem paths the sandbox's `SandboxPolicy` allows (`read_only`
+    /// ∪ `read_write`). `policy_propose` subset-checks proposed child
+    /// `external_mounts` against these: a mount is admissible iff its path
+    /// is a subpath of at least one entry here. Empty vec skips the check.
+    pub sandbox_fs_paths: Vec<std::path::PathBuf>,
 }
 
 /// Sign a request body with HMAC-SHA256 and POST it to the bridge.
@@ -191,6 +196,7 @@ pub async fn dispatch(ctx: &SyscallContext, req: &Request, _peer: &PeerCred) -> 
                 ctx.approval_bridge_url.as_deref(),
                 ctx.webhook_secret.as_deref(),
                 ctx.trust_spec.as_ref(),
+                &ctx.sandbox_fs_paths,
             )
             .await
             {

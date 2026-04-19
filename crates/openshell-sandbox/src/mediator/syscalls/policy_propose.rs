@@ -9,9 +9,40 @@ use crate::mediator::policy::validate::{self, PolicyValidationError};
 use crate::mediator::store::queries;
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{info, warn};
+
+/// Validate that a proposed policy's filesystem mounts are subpaths of the
+/// sandbox's allowed paths (`FilesystemPolicy.read_only ∪ read_write`).
+///
+/// Returns `Ok(())` if every mount is a subpath of at least one entry in
+/// `sandbox_fs_paths`. Returns `Err(detail)` with the first offending mount
+/// on failure. When `sandbox_fs_paths` is empty the check is skipped —
+/// used in tests and for backward compat with deployments that don't yet
+/// plumb the sandbox policy.
+pub(crate) fn check_fs_subset(
+    proposed: &MediationPolicy,
+    sandbox_fs_paths: &[PathBuf],
+) -> Result<(), String> {
+    if sandbox_fs_paths.is_empty() {
+        return Ok(());
+    }
+    for mount in &proposed.external_mounts {
+        let mount_path = Path::new(&mount.path);
+        let admissible = sandbox_fs_paths
+            .iter()
+            .any(|allowed| mount_path.starts_with(allowed));
+        if !admissible {
+            return Err(format!(
+                "external_mount '{}' is not a subpath of any sandbox filesystem entry (sandbox allows: {:?})",
+                mount.path, sandbox_fs_paths
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Parameters for `policy_propose`.
 #[derive(Debug, serde::Deserialize)]
@@ -38,7 +69,16 @@ pub async fn handle_policy_propose(
     approval_bridge_url: Option<&str>,
     webhook_secret: Option<&str>,
     trust_spec: Option<&Arc<TrustSpec>>,
+    sandbox_fs_paths: &[PathBuf],
 ) -> Result<serde_json::Value, String> {
+    // Subset check against the live sandbox policy. Filesystem only for
+    // now — network subset is still enforced at runtime by the proxy's
+    // UidPolicyRegistry fast path. This check catches mounts that the
+    // sandbox never granted, so the bridge is never asked to approve
+    // something the sandbox filesystem can't actually deliver.
+    check_fs_subset(&params.config, sandbox_fs_paths)
+        .map_err(|detail| format!("subset_check_failed: {detail}"))?;
+
     // Build existing names set for immutability check.
     let taint_warnings = {
         let guard = policies.read().await;
@@ -266,8 +306,68 @@ async fn store_taint_on_approval(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mediator::policy::ExternalMount;
     use crate::mediator::store::MediatorStore;
     use tokio::sync::RwLock;
+
+    fn policy_with_mounts(name: &str, paths: &[&str]) -> MediationPolicy {
+        MediationPolicy {
+            policy_name: name.into(),
+            rationale: "test".into(),
+            http_allowlist: vec![],
+            external_mounts: paths
+                .iter()
+                .map(|p| ExternalMount {
+                    path: (*p).into(),
+                    mode: "r".into(),
+                })
+                .collect(),
+            allowed_child_policies: vec![],
+            bind_ports: None,
+            allowed_ipc_targets: vec![],
+            allowed_signal_targets: vec![],
+            allowed_launch_commands: vec![],
+        }
+    }
+
+    #[test]
+    fn fs_subset_skipped_when_sandbox_paths_empty() {
+        let p = policy_with_mounts("test", &["/anywhere"]);
+        assert!(check_fs_subset(&p, &[]).is_ok());
+    }
+
+    #[test]
+    fn fs_subset_accepts_exact_match() {
+        let p = policy_with_mounts("test", &["/workspace"]);
+        let sandbox = vec![PathBuf::from("/workspace")];
+        assert!(check_fs_subset(&p, &sandbox).is_ok());
+    }
+
+    #[test]
+    fn fs_subset_accepts_subpath() {
+        let p = policy_with_mounts("test", &["/workspace/fetcher"]);
+        let sandbox = vec![PathBuf::from("/workspace")];
+        assert!(check_fs_subset(&p, &sandbox).is_ok());
+    }
+
+    #[test]
+    fn fs_subset_rejects_path_outside_sandbox() {
+        let p = policy_with_mounts("test", &["/etc/secrets"]);
+        let sandbox = vec![PathBuf::from("/workspace"), PathBuf::from("/tmp")];
+        let err = check_fs_subset(&p, &sandbox).unwrap_err();
+        assert!(err.contains("/etc/secrets"));
+        assert!(err.contains("not a subpath"));
+    }
+
+    #[test]
+    fn fs_subset_rejects_sibling_prefix_trap() {
+        // /workspace-other is NOT a subpath of /workspace even though
+        // "/workspace-other".starts_with("/workspace") is true as a string.
+        // PathBuf::starts_with handles components correctly.
+        let p = policy_with_mounts("test", &["/workspace-other/data"]);
+        let sandbox = vec![PathBuf::from("/workspace")];
+        assert!(check_fs_subset(&p, &sandbox).is_err());
+    }
 
     fn empty_policies() -> Arc<RwLock<HashMap<String, MediationPolicy>>> {
         Arc::new(RwLock::new(HashMap::new()))
@@ -299,7 +399,7 @@ mod tests {
             },
         };
 
-        let result = handle_policy_propose(store.pool(), &policies, params, None, None, None)
+        let result = handle_policy_propose(store.pool(), &policies, params, None, None, None, &[])
             .await
             .unwrap();
         assert_eq!(result["approved"], true);
@@ -325,7 +425,7 @@ mod tests {
         policies.write().await.insert("dup_v1".into(), p.clone());
 
         let params = PolicyProposeParams { config: p };
-        let err = handle_policy_propose(store.pool(), &policies, params, None, None, None)
+        let err = handle_policy_propose(store.pool(), &policies, params, None, None, None, &[])
             .await
             .unwrap_err();
         assert!(err.contains("already exists"));
@@ -349,7 +449,7 @@ mod tests {
             },
         };
 
-        let err = handle_policy_propose(store.pool(), &policies, params, None, None, None)
+        let err = handle_policy_propose(store.pool(), &policies, params, None, None, None, &[])
             .await
             .unwrap_err();
         assert!(err.contains("empty"));
@@ -380,6 +480,7 @@ mod tests {
             Some("http://127.0.0.1:19999"),
             None,
             None,
+            &[],
         )
         .await
         .unwrap_err();
@@ -422,7 +523,7 @@ trusted_external: []
             },
         };
 
-        let result = handle_policy_propose(store.pool(), &policies, params, None, None, Some(&spec))
+        let result = handle_policy_propose(store.pool(), &policies, params, None, None, Some(&spec), &[])
             .await
             .unwrap();
 
