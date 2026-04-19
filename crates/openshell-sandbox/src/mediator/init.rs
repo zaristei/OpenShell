@@ -382,35 +382,48 @@ fn create_wizard_policy(inference_endpoint: Option<&str>) -> MediationPolicy {
     }
 }
 
-/// Load an optional `initial_agent_policy_v1` from disk. Written by
-/// NemoClaw's onboarding flow when the operator picks the default agent's
-/// subset of the sandbox ceiling. When absent, the bootstrap does not
-/// preload an initial-agent policy; the sandbox entrypoint is responsible
-/// for either running directly under `init_v0` (today's behavior) or
-/// calling `policy_propose` to register something at runtime.
+/// Load an optional `initial_agent_policy_v1` from disk.
 ///
-/// File location: `/sandbox/.mediator/initial_agent_policy.yaml` (same
-/// format as any other `MediationPolicy` YAML).
+/// Searches two paths in order (first hit wins):
+///   1. `/sandbox/.mediator/initial_agent_policy.yaml` — operator-
+///      installed override in the persistent PVC. Highest precedence;
+///      the operator narrows the default here without rebuilding.
+///   2. `/opt/nemoclaw/initial_agent_policy.yaml` — image-bundled default
+///      (shipped by the NemoClaw sandbox image). Provides a minimal
+///      working policy so every deployment has *something* preloaded.
+///
+/// Returns `None` only when NEITHER file exists or both are malformed
+/// — in which case the sandbox entrypoint falls back to `init_v0`.
 fn load_initial_agent_policy() -> Option<MediationPolicy> {
-    let path = "/sandbox/.mediator/initial_agent_policy.yaml";
-    let body = std::fs::read_to_string(path).ok()?;
-    match serde_yml::from_str::<MediationPolicy>(&body) {
-        Ok(policy) => {
-            if policy.policy_name != "initial_agent_policy_v1" {
-                tracing::warn!(
-                    path,
-                    found = %policy.policy_name,
-                    "initial_agent_policy.yaml policy_name must be 'initial_agent_policy_v1'; ignoring"
-                );
-                return None;
+    const SEARCH_PATHS: &[&str] = &[
+        "/sandbox/.mediator/initial_agent_policy.yaml",
+        "/opt/nemoclaw/initial_agent_policy.yaml",
+    ];
+
+    for path in SEARCH_PATHS {
+        let Ok(body) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        match serde_yml::from_str::<MediationPolicy>(&body) {
+            Ok(policy) => {
+                if policy.policy_name != "initial_agent_policy_v1" {
+                    tracing::warn!(
+                        path,
+                        found = %policy.policy_name,
+                        "initial_agent_policy.yaml policy_name must be 'initial_agent_policy_v1'; ignoring"
+                    );
+                    continue;
+                }
+                tracing::info!(path, "loaded initial_agent_policy_v1");
+                return Some(policy);
             }
-            Some(policy)
-        }
-        Err(err) => {
-            tracing::warn!(path, %err, "failed to parse initial_agent_policy.yaml; ignoring");
-            None
+            Err(err) => {
+                tracing::warn!(path, %err, "failed to parse initial_agent_policy.yaml; trying next path");
+                continue;
+            }
         }
     }
+    None
 }
 
 /// Run the mediator daemon end-to-end: bootstrap then serve.
