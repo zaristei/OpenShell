@@ -14,6 +14,16 @@ repository.workspace = true
 name = "openshell-sandbox"
 path = "src/main.rs"
 
+[[bin]]
+name = "mediator-cli"
+path = "src/mediator_cli.rs"
+required-features = ["mediator-tools"]
+
+[[bin]]
+name = "mediator-daemon"
+path = "src/mediator_daemon.rs"
+required-features = ["mediator-tools"]
+
 [dependencies]
 openshell-core = { path = "../openshell-core" }
 openshell-ocsf = { path = "../openshell-ocsf" }
@@ -59,9 +69,20 @@ base64 = { workspace = true }
 # IP network / CIDR parsing
 ipnet = "2"
 
+# Content inspection
+regex = "1"
+
 # Serialization
+serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
+
+# Mediator: UDS wire protocol + SQLite store + fnmatch + daemon + HTTP
+glob = "0.3"
+tokio-util = { version = "0.7", features = ["codec"] }
+sqlx = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
@@ -74,10 +95,16 @@ nix = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# IDs (needed cross-platform for mediator ipc_connect)
+uuid = { version = "1", features = ["v4"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 seccompiler = "0.5"
-uuid = { version = "1", features = ["v4"] }
+
+[features]
+default = []
+mediator-tools = []
 
 [dev-dependencies]
 tempfile = "3"
